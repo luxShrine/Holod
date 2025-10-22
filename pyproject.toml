@@ -1,0 +1,121 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+
+requires = [ "setuptools>=68", "wheel" ]
+
+[project]
+name = "holod"
+version = "0.4.0"
+description = "CLI for hologram autofocus training / evaluation"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "beartype>=0.21",
+  "click>=8.1,<8.2",
+  "dash>=3.0.4",
+  "kaleido>=1.0.0",
+  "lightning>=2.5.2",
+  "matplotlib>=3.10.1",
+  "numpy>=2.2.4",
+  "pillow>=11.2.1",
+  "pint>=0.24.4",
+  "plotly>=6.0.1",
+  "plotly-stubs>=0.0.5",
+  "polars>=1.27.1",
+  "pyserde[all]>=0.24.0",
+  "python-json-logger>=3.3.0",
+  "rich>=13.6",
+  "scikit-learn>=1.7.1",
+  "scipy>=1.15.2",
+  "statsmodels>=0.14.4",
+  "timm>=1.0.15",
+  "torch>=2.6",
+  "torchvision>=0.21",
+]
+
+scripts.holod = "holod.cli:cli"
+
+[tool.setuptools]
+package-dir = { "" = "src" } # everything lives in src/
+
+[tool.setuptools.packages.find] 
+where = [ "src" ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = [ "src", "tests" ]
+exclude = [ ".venv", "src/data", "src/checkpoints" ]
+respect-gitignore = true
+unsafe-fixes = true
+show-fixes = true
+format.quote-style = "double"
+format.docstring-code-format = true
+
+[tool.ruff.lint]
+isort.known-first-party = [ "holod" ]
+isort.known-third-party = [ "matplotlib", "torch", "torchvision", "polars", "numpy", "PIL" ]
+select = [
+  "B",
+  "D",
+  "F",   # Pyflakes rules
+  "W",   # PyCodeStyle warnings
+  "E",   # PyCodeStyle errors
+  "I",   # Sort imports properly
+  "UP",  # Warn if certain things can changed due to newer Python versions
+  "C4",  # Catch incorrect use of comprehensions, dict, list, etc
+  "FA",  # Enforce from __future__ import annotations
+  "ISC", # Good use of string concatenation
+  "ICN", # Use common import conventions
+  "RET", # Good return practices
+  "SIM", # Common simplification rules
+  "TID", # Some good import practices
+  "TC",  # Enforce importing certain types in a TYPE_CHECKING block
+  # "PTH", # Use pathlib instead of os.path
+  "TD",  # Be diligent with TODO comments
+  "NPY", # Some numpy-specific things
+]
+ignore = [
+  "D100",   # Missing docstring in public module
+  "D104",   # no module-level docstring
+  "D203",   # blank line required before class docstring
+  "D211",   # no-blank-line-before-class
+  "D213",   # multi-line-summary-second-line
+  "B008",   # call function in argument default
+  "ISC001", # Conflicts with formatter ruff
+  "TD002",  # Author in todo
+  "TD003",  # Issue in todo
+  "W291",   # Trailing whitespace
+  "W293",   # Line only has whitespace
+  "ISC003", # Implicit string concatenation
+]
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+typeCheckingMode = "standard" # off, basic, standard, strict, recommended, all 
+allowedUntypedLibraries = [
+  "matplotlib",
+  "mpl_toolkits",
+  # "plotly.graph_objects" 
+]
+reportMissingTypeStubs = false
+exclude = [ "src/tex", "src/static", "logs/", "src/data", "**/__pycache__" ]
+include = [ "src/holod" ]
+reportExplicitAny = "none"
+reportCallInDefaultInitializer = "none"
+
+[dependency-groups]
+dev = [
+    "line-profiler>=4.2",
+    "mypy>=1.17.1",
+    "pytest>=8.4.1",
+    "pytest-cov>=6.2.1",
+    "ruff>=0.11.7",
+    "scipy-stubs>=1.16.1.1",
+    "ty>=0.0.1a6",
+]

@@ -1,0 +1,12 @@
+# ignore anything in this folder
+*
+
+# Except the gitignore 
+!.gitignore
+
+# latex items if putting the paper up in raw form
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+

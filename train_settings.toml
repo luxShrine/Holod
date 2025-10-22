@@ -1,0 +1,23 @@
+[paths]
+dataset_root = "MW-Dataset"
+meta_csv_name = "ODP-DLHM-Database.csv" # Name of the metadata CSV file.
+
+[train]
+backbone = "Enet"                       # Model backbone name.
+batch_size = 16                         # Training batch size.
+crop_size = 224                         # Size to crop images to.
+device = "cuda"                         # Device for training.
+epoch_count = 15                        # Number of training epochs.
+learning_rate = 0.0001                  # default: 0.0001, How fast should the model change epoch to epoch
+num_classes = 10                        # Number of classifications, set to 1 for regression training.
+num_workers = 6
+optimizer_weight_decay = 1e-2           # discourages overfitting by adding a penalty to the models weights
+sch_factor = 0.1                        # how much to decrease the learning rate  
+sch_patience = 7                        # default 10, how many epochs with no improvement for the learning rate to be reduced
+val_split = 0.1                         # Fraction of data for validation.
+
+[flags]
+checkpoint = false                      # Continue from checkpoint
+create_csv = false                      # Create a CSV for data.
+fixed_seed = true                       # Keep the random seed consistent.
+sample = false                          # Use sample data provided.

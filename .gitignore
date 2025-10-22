@@ -1,0 +1,34 @@
+# output files
+/*.pdf
+report.html
+arxiv.tar.gz
+
+# the trained models & checkpoints
+*.pth
+*.tar
+*.ckpt
+checkpoints/lightning_logs/*
+
+
+# Figure output
+src/tex/figures/*
+
+# created test images
+src/tests/images/*
+!src/tests/images/source*.jpg
+
+# Miscellaneous
+src/*.egg-info
+__pycache__
+*.synctex.gz
+*.bak
+*.html
+*.prof
+*.coverage
+
+# logs
+*.log
+*.json
+*.jsonl
+logs/*
+!logs/.gitkeep 
