@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast, override
 
@@ -40,9 +41,39 @@ from holod.infra.util.types import (
 
 logger = get_logger(__name__)
 
+# -- utils -------------------------------------------------------
 # how many models to be kept
 MAX_MODEL_HISTORY: int = 4
 EXPECTED_IMPROVEMENT_PERCENT: float = 1e-3
+
+
+def remove_oldest_checkpoint(files_in_out_dir: list[str]) -> None:
+    """Remove the oldest checkpoint if max model history is reached."""
+    if len(files_in_out_dir) > (MAX_MODEL_HISTORY + 1):
+        # clean up directory if needed to preserve storage
+        # if checkpoint folder has > MAX_MODEL_HISTORY, remove oldest
+        # find files that end in ".pth"
+        file_count_pth: int = 0
+        oldest_mod_time: float = np.inf
+        oldest_file: Path | None = None
+        for out_file in files_in_out_dir:
+            if out_file.endswith(".pth"):
+                file_count_pth += 1
+                path_out_file: Path = Path(out_file)
+                current_mod_time: float = path_out_file.stat().st_mtime
+                if current_mod_time < oldest_mod_time:
+                    oldest_file = path_out_file
+                    oldest_mod_time = current_mod_time
+        # remove oldest_file if limit reached
+        if file_count_pth > MAX_MODEL_HISTORY and oldest_file is not None:
+            logger.debug(
+                f"Max model history limit of {MAX_MODEL_HISTORY} "
+                + f"reached, deleting {oldest_file}"
+            )
+            oldest_file.unlink()
+
+
+# ---------------------------------------------------------
 
 
 class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
@@ -239,190 +270,37 @@ def transform_ds(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
     return core_trainer_config
 
 
-def remove_oldest_checkpoint(files_in_out_dir: list[str]) -> None:
-    """Remove the oldest checkpoint if max model history is reached."""
-    if len(files_in_out_dir) > (MAX_MODEL_HISTORY + 1):
-        # clean up directory if needed to preserve storage
-        # if checkpoint folder has > MAX_MODEL_HISTORY, remove oldest
-        # find files that end in ".pth"
-        file_count_pth: int = 0
-        oldest_mod_time: float = np.inf
-        oldest_file: Path | None = None
-        for out_file in files_in_out_dir:
-            if out_file.endswith(".pth"):
-                file_count_pth += 1
-                path_out_file: Path = Path(out_file)
-                current_mod_time: float = path_out_file.stat().st_mtime
-                if current_mod_time < oldest_mod_time:
-                    oldest_file = path_out_file
-                    oldest_mod_time = current_mod_time
-        # remove oldest_file if limit reached
-        if file_count_pth > MAX_MODEL_HISTORY and oldest_file is not None:
-            logger.debug(
-                f"Max model history limit of {MAX_MODEL_HISTORY} "
-                + f"reached, deleting {oldest_file}"
-            )
-            oldest_file.unlink()
+@dataclass
+class TrainProgress:
+    best_val: float
+    save_best: bool
 
 
-def train_eval_epoch(
-    core_trainer: CoreTrainer, a_cfg: AutoConfig, best_val_metric: float, ckpt: Checkpoint | None
-) -> TrainingOutput:
-    """Trains model over one epoch.
-
-    Returns:
-        float: Average loss of the model after epoch completes.
-
-    """
-    labels_tensor: Tensor = torch.empty([1, 1]) if ckpt is None else ckpt.l_tens.to(a_cfg.device())
-    epoch_metric: EpochMetric = EpochMetric(metric_val=0 if ckpt is None else ckpt.val_metric)
-    avg_loss_train: float = 0 if ckpt is None else ckpt.train_loss
-    avg_loss_val: float = 0 if ckpt is None else ckpt.val_loss
-    metric_val_hist: list[float] = []
-
-    # Paths
-    checkpoint_dir = checkpoints_loc()
-    checkpoint_dir.mkdir(exist_ok=True)
-
-    path_to_checkpoint: Path = checkpoint_dir / Path("latest_checkpoint.tar")
-    path_to_model: Path = checkpoint_dir / Path(f"checkpoint_{a_cfg.backbone.name}.pth")
-    progress_bar, train_task, val_task, epoch_task = setup_training_progress(
-        a_cfg, ckpt, core_trainer, torch.cuda.get_device_name()
-    )
-
-    _ = core_trainer.model.train()
-
-    with progress_bar:  # allow for tracking of progress
-        for epoch in range(a_cfg.epoch_count):
-            for loader in [core_trainer.train_loader, core_trainer.val_loader]:
-                if loader is core_trainer.train_loader:
-                    # -- Training ----------------------------------------------------------------
-                    # ensure model is on proper device
-                    progress_bar.reset(
-                        train_task,
-                        total=len(core_trainer.train_loader),
-                        train_loss=0,
-                    )
-                    epoch_metric = epoch_loop(
-                        a_cfg, core_trainer, progress_bar, train_task, "train"
-                    )
-                    avg_loss_train = epoch_metric.average_loss()
-                else:
-                    # -- Evaluation Loop ---------------------------------------------------------
-                    progress_bar.reset(
-                        val_task,
-                        total=len(core_trainer.val_loader),
-                        val_loss=0,
-                    )
-                    with torch.no_grad():
-                        epoch_metric = epoch_loop(
-                            a_cfg, core_trainer, progress_bar, val_task, "val"
-                        )
-                        avg_loss_val = epoch_metric.average_loss()
-
-            if a_cfg.analysis == AnalysisType.REG:
-                # Lower MAE is better
-                if epoch_metric.metric_val < best_val_metric:
-                    best_val_metric = epoch_metric.metric_val
-                logger.debug(
-                    f"At {epoch} / {a_cfg.epoch_count} Val Acc: \
-                    {epoch_metric.metric_val * 100:.2f} %"
-                )
-            else:
-                # Higher Accuracy is better
-                if epoch_metric.metric_val > best_val_metric:
-                    best_val_metric = epoch_metric.metric_val
-                logger.debug(
-                    f"At {epoch} / {a_cfg.epoch_count} Val MAE: {epoch_metric.metric_val:.9f} µm"
-                )
-            # -- test if model is still improving ------------------------------------------------
-
-            # store metric val from epochs previous
-            metric_val_hist.append(epoch_metric.metric_val)
-            (model_improvement_flag, save_best_model_flag) = _check_model_improvement(
-                metric_val_hist,
-                epoch_metric,
-                a_cfg,
-                best_val_metric,
-                epoch,
-            )
-
-            if not model_improvement_flag:
-                break
-
-            # -- Save best model, if metric is better --------------------------------------------
-            if save_best_model_flag:
-                # convert best_val_metric form of 5 numbers, in scientific notation
-                # create file with name that is unique to evaluation
-                best_model_name: str = (
-                    path_to_model.name.removesuffix(".pth") + f"{best_val_metric:3e}" + ".pth"
-                )
-                path_to_model_detail = path_to_model.parent / Path(best_model_name)
-
-                # get files in out directory
-                files_in_out_dir: list[str] = [
-                    f.as_posix() for f in path_to_model_detail.parent.iterdir()
-                ]
-                # check if files in directory has potential amount of
-                # files to reach limit before loop.
-                remove_oldest_checkpoint(files_in_out_dir)
-
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": core_trainer.model.state_dict(),
-                        "labels": labels_tensor,
-                        "bin_centers": getattr(core_trainer.train_loader, "bin_centers", None),
-                        "num_classes": a_cfg.num_classes,
-                        "val_metric": best_val_metric,
-                        "model_type": a_cfg.backbone,
-                    },
-                    path_to_model_detail,
-                )
-
-            # Save latest model, after going through both loaders
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": core_trainer.model.state_dict(),
-                    "bin_centers": getattr(core_trainer.train_loader, "bin_centers", None),
-                    "num_classes": a_cfg.num_classes,
-                    "labels": epoch_metric.labels_tensor,
-                    "optimizer_state_dict": core_trainer.optimizer.state_dict(),
-                    "train_loss": avg_loss_train,
-                    "val_loss": avg_loss_val,
-                    "val_metric": epoch_metric.metric_val,
-                    "model_type": a_cfg.backbone,
-                },
-                path_to_checkpoint,
-            )
-
-            progress_bar.update(
-                epoch_task,
-                advance=1,
-                train_loss=avg_loss_train,
-                val_loss=avg_loss_val,
-                val_err=epoch_metric.metric_val,
-                lr=core_trainer.optimizer.param_groups[0]["lr"],
-            )
-
-    return TrainingOutput(avg_loss_train, avg_loss_val, epoch_metric.metric_val, best_val_metric)
+type TrainStatus = TrainProgress | None
 
 
 def _check_model_improvement(
     metric_val_hist: list[float],
     epoch_metric: EpochMetric,
     a_cfg: AutoConfig,
-    best_val_metric: float,
+    best_val: float,
     epoch: int,
     short_range: int = 3,
     long_range: int = 5,
-) -> tuple[bool, bool]:
-    save_best_model_flag: bool = False
-    model_improvement_flag: bool = True
+) -> TrainStatus:
+    if a_cfg.analysis == AnalysisType.REG:
+        # Lower MAE is better
+        best_val_out = epoch_metric.metric_val if epoch_metric.metric_val < best_val else best_val
+        logger.debug(
+            f"At {epoch} / {a_cfg.epoch_count} Val Acc: {epoch_metric.metric_val * 100:.2f} %"
+        )
+    else:
+        # Higher Accuracy is better
+        best_val_out = epoch_metric.metric_val if epoch_metric.metric_val > best_val else best_val
+        logger.debug(f"At {epoch} / {a_cfg.epoch_count} Val MAE: {epoch_metric.metric_val:.9f} µm")
 
     if epoch > (a_cfg.epoch_count / 5) and epoch >= 10:
-        if epoch_metric.metric_val < best_val_metric:
+        if epoch_metric.metric_val < best_val_out:
             save_best_model_flag = True
 
         # get percent diff to measure improvement, desire current < previous
@@ -444,9 +322,9 @@ def _check_model_improvement(
                 print(
                     "Training stopping, little to no improvement after " + f"{long_range} epochs",
                 )
-                model_improvement_flag = False
+                return None
 
-    return model_improvement_flag, save_best_model_flag
+    return TrainProgress(best_val_out, save_best_model_flag)
 
 
 # TODO: this is recreating an array each time, only need to calculate the newest values
@@ -550,7 +428,6 @@ def epoch_loop(
             core_trainer.optimizer.zero_grad()  # reset gradients each loop
 
         # sum the value of the loss, scaled to the size of image tensor
-        # epoch_metric.loss_epoch += cast("float", (loss_fn_current.item() * imgs_tens.size(0)))
         epoch_metric.loss_epoch += cast("float", loss_fn_current.item())
         epoch_metric.total_samples += imgs_tens.size(0)
 
@@ -622,6 +499,130 @@ def load_ckpt(path_ckpt: str, optimizer: Optimizer, model: nn.Module, device: st
     )
 
     return ckpt
+
+
+def train_eval_epoch(
+    core_trainer: CoreTrainer, a_cfg: AutoConfig, best_val_metric: float, ckpt: Checkpoint | None
+) -> TrainingOutput:
+    """Trains model over one epoch.
+
+    Returns:
+        float: Average loss of the model after epoch completes.
+
+    """
+    labels_tensor: Tensor = torch.empty([1, 1]) if ckpt is None else ckpt.l_tens.to(a_cfg.device())
+    epoch_metric: EpochMetric = EpochMetric(metric_val=0 if ckpt is None else ckpt.val_metric)
+    avg_loss_train: float = 0 if ckpt is None else ckpt.train_loss
+    avg_loss_val: float = 0 if ckpt is None else ckpt.val_loss
+    metric_val_hist: list[float] = []
+
+    # Paths
+    checkpoint_dir = checkpoints_loc()
+    checkpoint_dir.mkdir(exist_ok=True)
+
+    path_to_checkpoint: Path = checkpoint_dir / Path("latest_checkpoint.tar")
+    path_to_model: Path = checkpoint_dir / Path(f"checkpoint_{a_cfg.backbone.name}.pth")
+    progress_bar, train_task, val_task, epoch_task = setup_training_progress(
+        a_cfg, ckpt, core_trainer, torch.cuda.get_device_name()
+    )
+
+    _ = core_trainer.model.train()
+
+    with progress_bar:  # allow for tracking of progress
+        for epoch in range(a_cfg.epoch_count):
+            for loader in [core_trainer.train_loader, core_trainer.val_loader]:
+                if loader is core_trainer.train_loader:
+                    # -- Training ----------------------------------------------------------------
+                    # ensure model is on proper device
+                    progress_bar.reset(
+                        train_task,
+                        total=len(core_trainer.train_loader),
+                        train_loss=0,
+                    )
+                    epoch_metric = epoch_loop(
+                        a_cfg, core_trainer, progress_bar, train_task, "train"
+                    )
+                    avg_loss_train = epoch_metric.average_loss()
+                else:
+                    # -- Evaluation Loop ---------------------------------------------------------
+                    progress_bar.reset(
+                        val_task,
+                        total=len(core_trainer.val_loader),
+                        val_loss=0,
+                    )
+                    with torch.no_grad():
+                        epoch_metric = epoch_loop(
+                            a_cfg, core_trainer, progress_bar, val_task, "val"
+                        )
+                        avg_loss_val = epoch_metric.average_loss()
+
+            # -- test if model is still improving ------------------------------------------------
+
+            # store metric val from epochs previous
+            metric_val_hist.append(epoch_metric.metric_val)
+            train_status = _check_model_improvement(
+                metric_val_hist, epoch_metric, a_cfg, best_val_metric, epoch
+            )
+            if train_status is None:
+                break
+            # -- Save best model, if metric is better --------------------------------------------
+            if train_status.save_best:
+                best_val_metric = train_status.best_val
+                # convert best_val_metric form of 5 numbers, in scientific notation
+                # create file with name that is unique to evaluation
+                best_model_name: str = (
+                    path_to_model.name.removesuffix(".pth") + f"{best_val_metric:3e}" + ".pth"
+                )
+                path_to_model_detail = path_to_model.parent / Path(best_model_name)
+
+                # get files in out directory
+                files_in_out_dir: list[str] = [
+                    f.as_posix() for f in path_to_model_detail.parent.iterdir()
+                ]
+                # check if files in directory has potential amount of
+                # files to reach limit before loop.
+                remove_oldest_checkpoint(files_in_out_dir)
+
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": core_trainer.model.state_dict(),
+                        "labels": labels_tensor,
+                        "bin_centers": getattr(core_trainer.train_loader, "bin_centers", None),
+                        "num_classes": a_cfg.num_classes,
+                        "val_metric": best_val_metric,
+                        "model_type": a_cfg.backbone,
+                    },
+                    path_to_model_detail,
+                )
+
+            # Save latest model, after going through both loaders
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": core_trainer.model.state_dict(),
+                    "bin_centers": getattr(core_trainer.train_loader, "bin_centers", None),
+                    "num_classes": a_cfg.num_classes,
+                    "labels": epoch_metric.labels_tensor,
+                    "optimizer_state_dict": core_trainer.optimizer.state_dict(),
+                    "train_loss": avg_loss_train,
+                    "val_loss": avg_loss_val,
+                    "val_metric": epoch_metric.metric_val,
+                    "model_type": a_cfg.backbone,
+                },
+                path_to_checkpoint,
+            )
+
+            progress_bar.update(
+                epoch_task,
+                advance=1,
+                train_loss=avg_loss_train,
+                val_loss=avg_loss_val,
+                val_err=epoch_metric.metric_val,
+                lr=core_trainer.optimizer.param_groups[0]["lr"],
+            )
+
+    return TrainingOutput(avg_loss_train, avg_loss_val, epoch_metric.metric_val, best_val_metric)
 
 
 def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotPred:
