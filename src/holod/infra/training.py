@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast, override
 
@@ -19,7 +21,6 @@ from torchvision.transforms import v2
 from holod.core.plots import PlotPred, TrainingRepeatConfig
 from holod.infra.dataclasses import (
     AutoConfig,
-    Checkpoint,
     CoreTrainer,
     EpochMetric,
     TrainingOutput,
@@ -478,28 +479,119 @@ def epoch_loop(
     return epoch_metric
 
 
-def load_ckpt(path_ckpt: str, optimizer: Optimizer, model: nn.Module, device: str) -> Checkpoint:
-    """Load a training checkpoint, restore optimizer and model state."""
-    checkpoint_load: dict[str, Any] = torch.load(path_ckpt, weights_only=True, map_location=device)
-    # returns unexepected keys or missing keys for the model if either case occurs
-    missing_keys = model.load_state_dict(checkpoint_load["model_state_dict"])
-    # must move model onto expected device before loading optimiser
-    _ = model.to(device)
-    if len(missing_keys) > 0:
-        logger.info(f"{missing_keys}")
+type StateDict = dict[str, Any]
 
-    optimizer.load_state_dict(checkpoint_load["optimizer_state_dict"])
-    ckpt: Checkpoint = Checkpoint(
-        epoch=checkpoint_load["epoch"],
-        train_loss=checkpoint_load["train_loss"],
-        val_loss=checkpoint_load["val_loss"],
-        val_metric=checkpoint_load["val_metric"],
-        bin_centers=checkpoint_load["bin_centers"],
-        num_classes=checkpoint_load["num_bins"],
-        l_tens=checkpoint_load["labels"],
-    )
 
-    return ckpt
+# TODO: migrate to use this dataclass, for both checkpoint and model, have model
+# just subsume this class <10-31-25, >
+@dataclass
+class Checkpoint:
+    """Serialized training state used for resuming."""
+
+    epoch: int
+    model_statedict: StateDict
+    labels: torch.Tensor
+    bin_centers: Arr32 | None
+    num_classes: int
+    val_metric: float
+    model_type: ModelType
+
+    @classmethod
+    def from_dict(cls, torch_dict: dict[str, Any]) -> Checkpoint:
+        return cls(
+            epoch=torch_dict["epoch"],
+            model_statedict=torch_dict["model_state_dict"],
+            labels=torch_dict["labels"],
+            val_metric=torch_dict["val_metric"],
+            bin_centers=torch_dict["bin_centers"],
+            num_classes=torch_dict["num_bins"],
+        )
+
+    @classmethod
+    def from_epoch(
+        cls,
+        epoch: int,
+        core_trainer: CoreTrainer,
+        labels_tensor,
+        a_cfg: AutoConfig,
+        val_metric: float,
+    ) -> Checkpoint:
+        cls(
+            epoch=epoch,
+            model_statedict=core_trainer.model.state_dict(),
+            labels=labels_tensor,
+            val_metric=getattr(core_trainer.train_loader, "bin_centers", None),
+            bin_centers=a_cfg.bin_centers,
+            num_classes=a_cfg.num_classes,
+        )
+        pass
+
+    def torch_save(self, path) -> None:
+        torch.save(
+            asdict(self),
+            path,
+        )
+
+
+@dataclass
+class ModelCheckpoint:
+    """Serialized training state used for models."""
+
+    checkpoint: Checkpoint
+    optimizer_statedict: StateDict
+    train_loss: float
+    val_loss: float
+
+    @classmethod
+    def from_epoch(
+        cls,
+        epoch: int,
+        core_trainer: CoreTrainer,
+        labels_tensor,
+        a_cfg: AutoConfig,
+        val_metric: float,
+        optimizer_statedict: StateDict,
+        train_loss: float,
+        val_loss: float,
+    ) -> ModelCheckpoint:
+        # Awlays save latest model, after going through both loaders
+        checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, a_cfg, val_metric)
+        return cls(
+            checkpoint=checkpoint,
+            optimizer_state_dict=core_trainer.optimizer.state_dict(),
+            train_loss=train_loss,
+            val_loss=val_loss,
+        )
+
+    @classmethod
+    def load_ckpt(
+        cls, path_ckpt: str, optimizer: Optimizer, model: nn.Module, device: str
+    ) -> ModelCheckpoint:
+        """Load a training checkpoint, restore optimizer and model state."""
+        torch_dict: dict[str, Any] = torch.load(path_ckpt, weights_only=True, map_location=device)
+        checkpoint = Checkpoint.from_dict(torch_dict)
+        # returns unexepected keys or missing keys for the model if either case occurs
+        missing_keys = model.load_state_dict()
+        # must move model onto expected device before loading optimiser
+        _ = model.to(device)
+        if len(missing_keys) > 0:
+            logger.info(f"{missing_keys}")
+
+        ckpt: ModelCheckpoint = cls(
+            checkpoint=checkpoint,
+            optimizer_statedict=torch_dict["optimizer_state_dict"],
+            train_loss=torch_dict["train_loss"],
+            val_loss=torch_dict["val_loss"],
+        )
+        optimizer.load_state_dict(ckpt.optimizer_statedict)
+
+        return ckpt
+
+    def torch_save(self, path) -> None:
+        torch.save(
+            asdict(self),
+            path,
+        )
 
 
 def train_eval_epoch(
@@ -524,7 +616,7 @@ def train_eval_epoch(
     path_to_checkpoint: Path = checkpoint_dir / Path("latest_checkpoint.tar")
     path_to_model: Path = checkpoint_dir / Path(f"checkpoint_{a_cfg.backbone.name}.pth")
     progress_bar, train_task, val_task, epoch_task = setup_training_progress(
-        a_cfg, ckpt, core_trainer, torch.cuda.get_device_name()
+        a_cfg, avg_loss_train, avg_loss_val, core_trainer, torch.cuda.get_device_name()
     )
 
     _ = core_trainer.model.train()
@@ -560,7 +652,7 @@ def train_eval_epoch(
             )
             if train_status is None:
                 break
-            # -- Save best model, if metric is better --------------------------------------------
+            # -- Save best checkpoint, if metric is better ---------------------------------------
             if train_status.save_best:
                 best_val_metric = train_status.best_val
                 # convert best_val_metric form of 5 numbers, in scientific notation
@@ -573,36 +665,23 @@ def train_eval_epoch(
                 # check if files in directory has potential amount of
                 # files to reach limit before loop.
                 remove_oldest_checkpoint(path_to_model_detail)
-
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": core_trainer.model.state_dict(),
-                        "labels": labels_tensor,
-                        "bin_centers": getattr(core_trainer.train_loader, "bin_centers", None),
-                        "num_classes": a_cfg.num_classes,
-                        "val_metric": best_val_metric,
-                        "model_type": a_cfg.backbone,
-                    },
-                    path_to_model_detail,
+                checkpoint = Checkpoint.from_epoch(
+                    epoch, core_trainer, labels_tensor, a_cfg, best_val_metric
                 )
+                checkpoint.torch_save(path_to_model_detail)
 
-            # Save latest model, after going through both loaders
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": core_trainer.model.state_dict(),
-                    "bin_centers": getattr(core_trainer.train_loader, "bin_centers", None),
-                    "num_classes": a_cfg.num_classes,
-                    "labels": epoch_metric.labels_tensor,
-                    "optimizer_state_dict": core_trainer.optimizer.state_dict(),
-                    "train_loss": avg_loss_train,
-                    "val_loss": avg_loss_val,
-                    "val_metric": epoch_metric.metric_val,
-                    "model_type": a_cfg.backbone,
-                },
-                path_to_checkpoint,
+            # Always save latest model, after going through both loaders
+            model_checkpoint = ModelCheckpoint.from_epoch(
+                epoch,
+                core_trainer,
+                labels_tensor,
+                a_cfg,
+                best_val_metric,
+                core_trainer.optimizer.state_dict,
+                avg_loss_train,
+                avg_loss_val,
             )
+            model_checkpoint.torch_save(path_to_model_detail)
 
             progress_bar.update(
                 epoch_task,
@@ -633,9 +712,11 @@ def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotP
     # with coretrainer and autoconfig created, we can load checkpoint
     best_val_metric: int | float
     if path_ckpt is not None:
-        ckpt = load_ckpt(path_ckpt, train_cfg.optimizer, train_cfg.model, a_config.device())
-        best_val_metric = ckpt.val_metric
-        bin_centers = ckpt.bin_centers
+        ckpt = ModelCheckpoint.load_ckpt(
+            path_ckpt, train_cfg.optimizer, train_cfg.model, a_config.device()
+        )
+        best_val_metric = ckpt.checkpoint.val_metric
+        bin_centers = ckpt.checkpoint.bin_centers
     else:
         # For measuring evaluation: classificaton is maximizing correct bins,
         # regression is minimizing the error from expected

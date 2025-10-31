@@ -46,11 +46,15 @@ class MetricColumn(ProgressColumn):
 
 
 def setup_training_progress(
-    a_cfg: AutoConfig, ckpt: Checkpoint | None, core_trainer: CoreTrainer, device_name: str
+    a_cfg: AutoConfig,
+    train_loss: float,
+    val_loss: float,
+    core_trainer: CoreTrainer,
+    device_name: str,
 ) -> tuple[Progress, TaskID, TaskID, TaskID]:
     """Create and configure a Rich Progress bar for training monitoring."""
-    train_loss_start: float = 0 if ckpt is None else ckpt.train_loss
-    val_loss_start: float = 0 if ckpt is None else ckpt.val_loss
+    train_loss_start: float = train_loss
+    val_loss_start: float = val_loss
 
     progress_bar = Progress(
         TextColumn("[bold blue]{task.description}", justify="right"),

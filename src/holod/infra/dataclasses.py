@@ -491,19 +491,6 @@ class CoreTrainer:
 
 
 @dataclass
-class Checkpoint:
-    """Serialized training state used for resuming."""
-
-    epoch: int
-    train_loss: float
-    val_loss: float
-    val_metric: float
-    bin_centers: npt.NDArray[np.float64] | None
-    num_classes: int
-    l_tens: torch.Tensor
-
-
-@dataclass
 class EpochMetric:
     """Output of one epoch of autofocus training."""
 
