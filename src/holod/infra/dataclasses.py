@@ -16,6 +16,7 @@ from torchvision import models
 
 import holod.infra.util.paths as paths
 from holod.infra.dataset import HologramFocusDataset
+from holod.infra.log import get_logger
 from holod.infra.util.types import (
     AnalysisType,
     CreateCSVOption,
@@ -25,7 +26,6 @@ from holod.infra.util.types import (
     SubsetList,
     UserDevice,
 )
-from holod.infra.log import get_logger
 
 if TYPE_CHECKING:
     import numpy as np
