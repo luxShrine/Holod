@@ -5,7 +5,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from line_profiler import profile
 from PIL.Image import Image as ImageType
 from rich.progress import (
     Progress,
@@ -151,64 +150,6 @@ class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
         return (tf_eval_ds, tf_train_ds)
 
 
-@profile
-def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotPred:
-    """Train the autofocus model and return plotting data."""
-    # load data
-    holo_base_ds = HologramFocusDataset(
-        mode=a_config.analysis,
-        num_classes=a_config.num_classes,
-        csv_file_strpath=a_config.meta_csv_strpath,
-    )
-
-    # transform that data
-    # distrubute to dataloaders
-    # get information to train/validate
-    train_cfg: CoreTrainer = transform_ds(holo_base_ds, a_config)
-
-    # with coretrainer and autoconfig created, we can load checkpoint
-    best_val_metric: int | float
-    if path_ckpt is not None:
-        ckpt = load_ckpt(path_ckpt, train_cfg.optimizer, train_cfg.model, a_config.device())
-        best_val_metric = ckpt.val_metric
-        bin_centers = ckpt.bin_centers
-
-    else:
-        # For measuring evaluation: classificaton is maximizing correct bins,
-        # regression is minimizing the error from expected
-        best_val_metric = float("inf") if a_config.analysis == AnalysisType.REG else -float("inf")
-        ckpt = None
-
-    # train/validate, for all epochs
-    training_output = train_eval_epoch(train_cfg, a_config, best_val_metric, ckpt)
-    training_output.display_loss()
-
-    # For class, train_cfg.evaluation_metric is base.bin_centers
-    bin_centers = holo_base_ds.bin_centers if a_config.analysis == AnalysisType.CLASS else None
-    # regression needs std and average
-    (z_avg, z_std) = train_cfg.get_std_avg(a_config.analysis)
-
-    # -- Get & Save Training Data for Plotting ---------------------------------------------------
-    # TODO: Save the object to json/pickle/torch file to have access to
-    # predictions for debugging/inspection purposes.
-    return PlotPred.from_z_preds(
-        auto_config=a_config,
-        train_cfg=train_cfg,
-        bin_centers=bin_centers,
-        avg_train_loss=training_output.avg_train_loss,
-        avg_val_loss=training_output.avg_val_loss,
-        bin_edges=holo_base_ds.bin_edges,
-        z_avg=z_avg,
-        z_std=z_std,
-        repeat_config=TrainingRepeatConfig(
-            a_config.to_user_config(),
-            training_output.avg_train_loss,
-            training_output.avg_val_loss,
-        ),
-    )
-
-
-@profile
 def transform_ds(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
     """Split the dataset, apply transforms and build dataloaders."""
     (train_subset, eval_subset) = a_cfg.setup_loader_indices(base)
@@ -474,6 +415,8 @@ def _check_model_improvement(
     a_cfg: AutoConfig,
     best_val_metric: float,
     epoch: int,
+    short_range: int = 3,
+    long_range: int = 5,
 ) -> tuple[bool, bool]:
     save_best_model_flag: bool = False
     model_improvement_flag: bool = True
@@ -487,8 +430,6 @@ def _check_model_improvement(
             epoch_metric, metric_val_hist, a_cfg.analysis
         )
 
-        short_range = 3
-        long_range = 5
         diff_short = abs(percent_diff_history[-short_range] - percent_diff_history[-1])
         diff_long = abs(percent_diff_history[-long_range] - percent_diff_history[-1])
 
@@ -540,7 +481,6 @@ def get_percent_diff_history(
         raise e
 
 
-@profile
 def epoch_loop(
     a_cfg: AutoConfig, core_trainer: CoreTrainer, progress_bar: Progress, task_id: TaskID, step: str
 ) -> EpochMetric:
@@ -621,7 +561,6 @@ def epoch_loop(
             # error is the distance from the correct value, z_pred -> z_true
             abs_err_sum += torch.sum(torch.abs(z_pred - z_true)).item()
             total_samples_for_metric += z_true.numel()  # num of elements
-
         else:
             # Get predicted class indices
             pred_classes = torch.argmax(pred, dim=1)  # Shape: [B]
@@ -683,3 +622,59 @@ def load_ckpt(path_ckpt: str, optimizer: Optimizer, model: nn.Module, device: st
     )
 
     return ckpt
+
+
+def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotPred:
+    """Train the autofocus model and return plotting data."""
+    # load data
+    holo_base_ds = HologramFocusDataset(
+        mode=a_config.analysis,
+        num_classes=a_config.num_classes,
+        csv_file_strpath=a_config.meta_csv_strpath,
+    )
+
+    # transform that data
+    # distrubute to dataloaders
+    # get information to train/validate
+    train_cfg: CoreTrainer = transform_ds(holo_base_ds, a_config)
+
+    # with coretrainer and autoconfig created, we can load checkpoint
+    best_val_metric: int | float
+    if path_ckpt is not None:
+        ckpt = load_ckpt(path_ckpt, train_cfg.optimizer, train_cfg.model, a_config.device())
+        best_val_metric = ckpt.val_metric
+        bin_centers = ckpt.bin_centers
+
+    else:
+        # For measuring evaluation: classificaton is maximizing correct bins,
+        # regression is minimizing the error from expected
+        best_val_metric = float("inf") if a_config.analysis == AnalysisType.REG else -float("inf")
+        ckpt = None
+
+    # train/validate, for all epochs
+    training_output = train_eval_epoch(train_cfg, a_config, best_val_metric, ckpt)
+    training_output.display_loss()
+
+    # For class, train_cfg.evaluation_metric is base.bin_centers
+    bin_centers = holo_base_ds.bin_centers if a_config.analysis == AnalysisType.CLASS else None
+    # regression needs std and average
+    (z_avg, z_std) = train_cfg.get_std_avg(a_config.analysis)
+
+    # -- Get & Save Training Data for Plotting ---------------------------------------------------
+    # TODO: Save the object to json/pickle/torch file to have access to
+    # predictions for debugging/inspection purposes.
+    return PlotPred.from_z_preds(
+        auto_config=a_config,
+        train_cfg=train_cfg,
+        bin_centers=bin_centers,
+        avg_train_loss=training_output.avg_train_loss,
+        avg_val_loss=training_output.avg_val_loss,
+        bin_edges=holo_base_ds.bin_edges,
+        z_avg=z_avg,
+        z_std=z_std,
+        repeat_config=TrainingRepeatConfig(
+            a_config.to_user_config(),
+            training_output.avg_train_loss,
+            training_output.avg_val_loss,
+        ),
+    )
