@@ -47,8 +47,10 @@ MAX_MODEL_HISTORY: int = 4
 EXPECTED_IMPROVEMENT_PERCENT: float = 1e-3
 
 
-def remove_oldest_checkpoint(files_in_out_dir: list[str]) -> None:
+def remove_oldest_checkpoint(path_to_model_detail: Path) -> None:
     """Remove the oldest checkpoint if max model history is reached."""
+    # get files in out directory
+    files_in_out_dir: list[Path] = list(path_to_model_detail.parent.iterdir())
     if len(files_in_out_dir) > (MAX_MODEL_HISTORY + 1):
         # clean up directory if needed to preserve storage
         # if checkpoint folder has > MAX_MODEL_HISTORY, remove oldest
@@ -57,12 +59,11 @@ def remove_oldest_checkpoint(files_in_out_dir: list[str]) -> None:
         oldest_mod_time: float = np.inf
         oldest_file: Path | None = None
         for out_file in files_in_out_dir:
-            if out_file.endswith(".pth"):
+            if out_file.as_posix().endswith(".pth"):
                 file_count_pth += 1
-                path_out_file: Path = Path(out_file)
-                current_mod_time: float = path_out_file.stat().st_mtime
+                current_mod_time: float = out_file.stat().st_mtime
                 if current_mod_time < oldest_mod_time:
-                    oldest_file = path_out_file
+                    oldest_file = out_file
                     oldest_mod_time = current_mod_time
         # remove oldest_file if limit reached
         if file_count_pth > MAX_MODEL_HISTORY and oldest_file is not None:
@@ -535,9 +536,7 @@ def train_eval_epoch(
                     # -- Training ----------------------------------------------------------------
                     # ensure model is on proper device
                     progress_bar.reset(
-                        train_task,
-                        total=len(core_trainer.train_loader),
-                        train_loss=0,
+                        train_task, total=len(core_trainer.train_loader), train_loss=0
                     )
                     epoch_metric = epoch_loop(
                         a_cfg, core_trainer, progress_bar, train_task, "train"
@@ -545,11 +544,7 @@ def train_eval_epoch(
                     avg_loss_train = epoch_metric.average_loss()
                 else:
                     # -- Evaluation Loop ---------------------------------------------------------
-                    progress_bar.reset(
-                        val_task,
-                        total=len(core_trainer.val_loader),
-                        val_loss=0,
-                    )
+                    progress_bar.reset(val_task, total=len(core_trainer.val_loader), val_loss=0)
                     with torch.no_grad():
                         epoch_metric = epoch_loop(
                             a_cfg, core_trainer, progress_bar, val_task, "val"
@@ -575,13 +570,9 @@ def train_eval_epoch(
                 )
                 path_to_model_detail = path_to_model.parent / Path(best_model_name)
 
-                # get files in out directory
-                files_in_out_dir: list[str] = [
-                    f.as_posix() for f in path_to_model_detail.parent.iterdir()
-                ]
                 # check if files in directory has potential amount of
                 # files to reach limit before loop.
-                remove_oldest_checkpoint(files_in_out_dir)
+                remove_oldest_checkpoint(path_to_model_detail)
 
                 torch.save(
                     {
@@ -645,7 +636,6 @@ def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotP
         ckpt = load_ckpt(path_ckpt, train_cfg.optimizer, train_cfg.model, a_config.device())
         best_val_metric = ckpt.val_metric
         bin_centers = ckpt.bin_centers
-
     else:
         # For measuring evaluation: classificaton is maximizing correct bins,
         # regression is minimizing the error from expected
