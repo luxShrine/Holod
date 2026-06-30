@@ -14,13 +14,13 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from torchvision import models
 
-import holo.infra.util.paths as paths
-from holo.infra.dataclasses import AutoConfig, CoreTrainer, FocusNetTorch, NeuralNetwork
-from holo.infra.dataset import HologramFocusDataset
-from holo.infra.log import get_logger
-from holo.infra.training import transform_ds
-from holo.infra.util.paths import t_loc
-from holo.infra.util.types import AnalysisType, ModelType
+import holod.infra.util.paths as paths
+from holod.infra.dataclasses import AutoConfig, CoreTrainer, FocusNetTorch, NeuralNetwork
+from holod.infra.dataset import HologramFocusDataset
+from holod.infra.log import get_logger
+from holod.infra.training import transform_ds
+from holod.infra.util.paths import t_loc
+from holod.infra.util.types import AnalysisType, ModelType
 
 logger = get_logger(__name__)
 
@@ -146,7 +146,7 @@ def test_loader():
 
 
 def test_evaluation_metric_class():
-    from holo.infra.training import transform_ds
+    from holod.infra.training import transform_ds
 
     # construct autoconfig
     auto_config_c = AutoConfig(num_workers=0, analysis=AnalysisType.CLASS)
@@ -202,7 +202,7 @@ def test_paths():
 
 
 def test_image_processing():
-    import holo.infra.util.image_processing as ip
+    import holod.infra.util.image_processing as ip
 
     # crop image
     image = Image.new(mode="RGB", size=(700, 500))
@@ -253,7 +253,7 @@ def test_image_processing():
 
 # def test_loading_config():
 #     from serde.toml import from_toml
-# from holo.infra.dataclasses import (
+# from holod.infra.dataclasses import (
 #     Flags,
 #     Paths,
 #     Train,

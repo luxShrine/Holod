@@ -11,7 +11,7 @@ from rich.progress import (
 )
 from rich.text import Text
 
-from holod.infra.dataclasses import AutoConfig, Checkpoint, CoreTrainer
+from holod.infra.dataclasses import AutoConfig, CoreTrainer
 from holod.infra.log import console_ as console
 
 # used to help align items that are printed, allows for one central area of control
