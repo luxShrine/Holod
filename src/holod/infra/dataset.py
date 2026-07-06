@@ -11,9 +11,18 @@ from PIL.Image import Image as ImageType
 from torch.utils.data import Dataset
 
 import holod.infra.util.paths as paths
-from holod.infra.util.image_processing import correct_data_csv, parse_info
-from holod.infra.util.types import AnalysisType, Arr32, Arr64, Mean, StandardDev
 from holod.infra.log import get_logger
+from holod.infra.util.image_processing import correct_data_csv, parse_info
+from holod.infra.util.types import (
+    AnalysisType,
+    Arr32,
+    Arr64,
+    Mean,
+    StandardDev,
+)
+
+if TYPE_CHECKING:
+    import numpy.typing as npt
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -52,7 +61,7 @@ class HologramDepths:
             return self.z_array[idx]
         if isinstance(idx, slice):
             return self.z_array[idx.start : idx.stop : idx.step]
-        raise TypeError("Invalid index type")
+        raise TypeError("Invalid index type")  # pyright: ignore[reportUnreachable]
 
     def subset_mean_std(self, subset_indices: Sequence[int]) -> tuple[Mean, StandardDev]:
         """Get the mean and standard deviation for a subset of the z depths."""
@@ -163,7 +172,7 @@ class HologramFocusDataset(Dataset[tuple[ImageType, np.float64 | int]]):
         """Read the values of the dataset, either from file or dataframe."""
         if existing_df is not None:
             return existing_df
-        return correct_data_csv(self.csv_file_path.resolve(), HOLO_DEF.resolve())
+        return correct_data_csv(self.csv_file_path.resolve())
 
     def check_dataset_length(self) -> None:
         """Check that dataset is not empty nor too small to train on."""

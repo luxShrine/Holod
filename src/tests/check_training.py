@@ -8,6 +8,7 @@ from typing import NewType
 
 import numpy as np
 import polars as pl
+import torch
 from PIL import Image, ImageEnhance
 from PIL.Image import Image as ImageType
 from torch import Tensor
@@ -20,7 +21,7 @@ from holod.infra.dataset import HologramFocusDataset
 from holod.infra.log import get_logger
 from holod.infra.training import transform_ds
 from holod.infra.util.paths import t_loc
-from holod.infra.util.types import AnalysisType, ModelType
+from holod.infra.util.types import AnalysisType, ModelType, UserDevice
 
 logger = get_logger(__name__)
 
@@ -171,12 +172,14 @@ def test_model_creation():
     res = AutoConfig(backbone=ModelType.RESNET)
     new = AutoConfig(num_classes=10, backbone=ModelType.NEW)
     enet = AutoConfig(backbone=ModelType.ENET)
-    focusnet = AutoConfig(backbone=ModelType.FOCUSNET)
+    focusnet = AutoConfig(num_classes=10, backbone=ModelType.FOCUSNET)
+    focusnet_reg = AutoConfig(backbone=ModelType.FOCUSNET, analysis=AnalysisType.REG)
 
     model_res = res.create_model()
     model_new = new.create_model()
     model_enet = enet.create_model()
     model_focusnet = focusnet.create_model()
+    model_focusnet_reg = focusnet_reg.create_model()
 
     assert isinstance(model_res, models.ResNet)
     assert isinstance(model_new, NeuralNetwork)
@@ -184,6 +187,58 @@ def test_model_creation():
     assert isinstance(model_focusnet, FocusNetTorch)
     # assert model_vit =
     # assert model_null = Exception
+
+    # focusnet takes a single-channel hologram and must size its head like the
+    # other backbones: num_classes logits for CLASS, one output for REG
+    holo = torch.rand(2, 1, 64, 64)
+    assert model_focusnet(holo).shape == (2, 10)
+    assert model_focusnet_reg(holo).shape == (2, 1)
+
+
+def test_backbone_static_stats():
+    """Static stats for a custom (non-pretrained) backbone on CPU."""
+    from holod.core.compare import collect_model_stats
+
+    cfg = AutoConfig(
+        backbone=ModelType.FOCUSNET,
+        num_classes=10,
+        crop_size=64,
+        device_user=UserDevice.CPU,
+        num_workers=0,
+    )
+    entry = collect_model_stats(cfg)
+    assert entry.backbone == ModelType.FOCUSNET.value
+    assert entry.total_params > 0
+    assert 0 < entry.trainable_params <= entry.total_params
+    assert entry.model_size_mb > 0
+    assert entry.input_channels == 1
+    assert entry.pretrained is False
+    assert entry.latency_ms_per_img is not None and entry.latency_ms_per_img > 0
+    assert entry.throughput_img_per_s is not None and entry.throughput_img_per_s > 0
+
+
+def test_compare_backbones_static():
+    """Compare custom backbones without training; report must render and serialize."""
+    from serde.json import to_json
+
+    from holod.core.compare import ComparisonReport, compare_backbones
+
+    cfg = AutoConfig(
+        num_classes=5,
+        crop_size=64,
+        device_user=UserDevice.CPU,
+        num_workers=0,
+    )
+    report = compare_backbones(
+        cfg, backbones=[ModelType.FOCUSNET, ModelType.NEW], run_training=False
+    )
+    assert report.trained is False
+    assert [s.backbone for s in report.stats] == [ModelType.FOCUSNET.value, ModelType.NEW.value]
+    assert all(s.error is None for s in report.stats)
+    assert all(s.best_val_metric is None for s in report.stats)
+    assert report.best_index() is None  # nothing trained, so no best backbone
+    _ = report.to_table()
+    assert len(to_json(report, ComparisonReport)) > 0
 
 
 def test_paths():
@@ -240,7 +295,7 @@ def test_image_processing():
         ]
     )
     df.write_csv(temp_csv_path, separator=";")
-    ip.correct_data_csv(temp_csv_path, TEST_IMGS)
+    ip.correct_data_csv(temp_csv_path)
     # TODO: create test for this final df
     temp_csv_path.unlink()
 
