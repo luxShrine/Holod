@@ -2,8 +2,8 @@ from typing import cast
 
 import numpy as np
 
-from holod.infra.util.types import Arr32, Arr64
 from holod.infra.log import get_logger
+from holod.infra.util.types import Arr32, Arr64
 
 logger = get_logger(__name__)
 

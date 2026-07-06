@@ -6,11 +6,10 @@ import atexit
 import logging
 import logging.config
 import logging.handlers as lh
-import multiprocessing as mp
+import queue
 import time
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
-from multiprocessing import Queue as MPQueue
 from pathlib import Path
 from typing import Any, Final
 
@@ -25,8 +24,10 @@ _LOG_FILE: Final[Path] = Path("logs/holo_log.jsonl")
 _LOG_LEVEL = "DEBUG"  # root level – override per logger if needed
 
 
-# Single, process‑safe queue for all log records
-_queue: MPQueue[logging.LogRecord] = mp.Queue(-1)
+# Thread-safe queue for all log records; the QueueListener runs in the same
+# process, so a multiprocessing.Queue (and its pipes) is unnecessary and breaks
+# at DataLoader-worker shutdown on Windows.
+_queue: queue.Queue[logging.LogRecord] = queue.Queue(-1)
 
 
 _LEVEL_STYLES: Final[dict[int, dict[str, object]]] = {
@@ -124,6 +125,10 @@ file_handler = RotatingFileHandler(
     maxBytes=2 * 1024 * 1024,  # 2 MB
     backupCount=1,
     encoding="utf-8",
+    # Dont open the file on import, the spawned DataLoader workers re-import this
+    # module, and an open handle in a worker makes rollover's os.rename fail on
+    # Windows (WinError 32).
+    delay=True,
 )
 file_handler.setFormatter(json_fmt)
 file_handler.setLevel(logging.DEBUG)
@@ -184,6 +189,9 @@ def init_logging() -> None:
     )
 
     # Quiet noisy libraries
+    # pyserde dumps its full generated serializer scope at DEBUG for every
+    # @serde class, which bloats the log file and forces constant rollovers.
+    logging.getLogger("serde").setLevel(logging.WARNING)
     # logging.getLogger("typer").setLevel(logging.WARNING)
     # logging.getLogger("click").setLevel(logging.WARNING)
 

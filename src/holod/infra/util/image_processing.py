@@ -49,16 +49,14 @@ def _is_valid(path: str) -> bool:
         return False
 
 
-def correct_data_csv(csv_path: Path, dataset_path: Path) -> pl.DataFrame:
-    """Ensure input dataframe maps on properly to data and paths."""
-    dataset_base_path: Path = dataset_path.parent.expanduser().resolve()
-    unfiltered_path_df: pl.DataFrame = pl.read_csv(csv_path, separator=";")  # read metadata CSV
+def correct_data_csv(csv_path: Path) -> pl.DataFrame:
+    """Ensure input dataframe maps on properly to data and paths.
 
-    # get each path, get rid of leading "./", prepend it with the path to dataset parent,
-    # replace original path column
-    # clean_abs_path_df: pl.DataFrame = unfiltered_path_df.with_columns(
-    #     pl.col("path").str.replace(r"\./", dataset_parent)
-    # )
+    CSV ``path`` entries are relative to the CSV file itself, so they are
+    resolved against the CSV's directory.
+    """
+    dataset_base_path: Path = csv_path.parent.expanduser().resolve()
+    unfiltered_path_df: pl.DataFrame = pl.read_csv(csv_path, separator=";")  # read metadata CSV
 
     abs_path_df: pl.DataFrame = unfiltered_path_df.with_columns(
         pl.col("path")

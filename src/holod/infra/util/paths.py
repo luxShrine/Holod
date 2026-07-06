@@ -21,6 +21,7 @@ def path_check(paths: dict[str, Path], *, raise_click: bool = True) -> None:
         paths: Mapping of symbolic names to filesystem locations.
         raise_click: When ``True``, missing paths are turned into ``ClickException``
             instances so CLI callers get concise error messages.
+
     """
     for variable, path_to_check in paths.items():
         try:

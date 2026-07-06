@@ -8,9 +8,9 @@ from PIL import Image
 from torchvision.transforms import v2
 
 from holod.infra.dataclasses import AutoConfig
+from holod.infra.log import get_logger
 from holod.infra.util.image_processing import crop_max_square
 from holod.infra.util.types import AnalysisType, Arr32, ModelType, ReconstructionMethod
-from holod.infra.log import get_logger
 
 if TYPE_CHECKING:
     from PIL.Image import Image as ImageType
@@ -38,6 +38,9 @@ def torch_recon(
 
     ## WARN: Fragile loading process...
     bin_centers = ckpt["bin_centers"]
+    # z normalization stats; absent on classification and pre-existing checkpoints
+    z_avg = ckpt.get("z_avg")
+    z_std = ckpt.get("z_std")
     cfg = AutoConfig(
         analysis=AnalysisType.REG if bin_centers is None else AnalysisType.CLASS,
         backbone=ckpt["model_type"],
@@ -96,6 +99,14 @@ def torch_recon(
             z_expect = float(
                 pred.squeeze()  # convert to scalar first
             )
+            if z_avg is not None and z_std is not None:
+                # reverse the label normalization applied during training
+                z_expect = z_expect * z_std + z_avg
+            else:
+                logger.warning(
+                    "Checkpoint lacks z_avg/z_std normalization stats; "
+                    + "regression output taken as-is."
+                )
 
     # torch expects float32
     intensity_image = np.asarray(crop_max_square(pil_image).convert("L"), np.float32) / 255.0
