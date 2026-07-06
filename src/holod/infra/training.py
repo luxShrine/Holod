@@ -2,21 +2,27 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, cast, override
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from PIL.Image import Image as ImageType
-from rich.progress import (
-    Progress,
-    TaskID,
-)
 from torch import Tensor
-from torch.optim import Optimizer
-from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms import v2
+
+from holod.infra.util.types import (
+    AnalysisType,
+    Arr32,
+    Arr64,
+    ModelType,
+    check_dtype,
+)
+
+if TYPE_CHECKING:
+    from rich.progress import (
+        Progress,
+        TaskID,
+    )
+    from torch.optim import Optimizer
 
 from holod.core.plots import PlotPred, TrainingRepeatConfig
 from holod.infra.dataclasses import (
@@ -24,27 +30,18 @@ from holod.infra.dataclasses import (
     CoreTrainer,
     EpochMetric,
     TrainingOutput,
+    transform_ds,
 )
 from holod.infra.dataset import HologramFocusDataset
-from holod.infra.log import console_ as console
 from holod.infra.log import get_logger
 from holod.infra.util.paths import checkpoints_loc
 from holod.infra.util.prog_helper import setup_training_progress
-from holod.infra.util.types import (
-    Q_,
-    AnalysisType,
-    Arr32,
-    ModelType,
-    SubsetImageDepth,
-    check_dtype,
-    u,
-)
 
 logger = get_logger(__name__)
 
 # -- utils -------------------------------------------------------
 # how many models to be kept
-MAX_MODEL_HISTORY: int = 4
+MAX_MODEL_HISTORY: int = 50
 EXPECTED_IMPROVEMENT_PERCENT: float = 1e-3
 
 
@@ -78,200 +75,6 @@ def remove_oldest_checkpoint(path_to_model_detail: Path) -> None:
 # ---------------------------------------------------------
 
 
-class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
-    """Transform the input dataset by applying transfomations to it's contents.
-
-    By wrapping the underlying dataset in this class, we can ensure that attrbutes
-    retrived from this new object will undergo the expected transfomrmations while
-    preserving the original data.
-
-    Attributes:
-        subset_obj: Subset[tuple[ImageType, np.float64]] Subset of the original
-                    dataset.
-        img_transform: v2.Compose | None  Transformation(s) to be applied to images.
-        label_transform: v2.Lambda | None Transformation(s) to be applied to labels.
-
-    """
-
-    def __init__(
-        self,
-        subset_obj: SubsetImageDepth,
-        img_transform: v2.Compose | None = None,
-        label_transform: v2.Lambda | None = None,
-    ) -> None:
-        """Initialize the wrapper with optional image and label transforms."""
-        # NOTE: v2 transformation classes != typical torch transformation classes
-        self.subset_obj: SubsetImageDepth = subset_obj
-        self.img_transform: v2.Compose | None = img_transform
-        self.label_transform: v2.Lambda | None = label_transform
-
-    @override
-    def __getitem__(self, idx: int) -> tuple[Any | ImageType, Any | np.float64]:
-        """Retrieve the image and label from the subest object."""
-        img, label = self.subset_obj[idx]  # Gets (PIL Image, raw_label)
-
-        if self.img_transform:
-            img = self.img_transform(img)
-        if self.label_transform:
-            label = self.label_transform(label)
-        return img, label
-
-    def __len__(self):
-        """Get number of entries in subset."""
-        return len(self.subset_obj)
-
-    @classmethod
-    def from_subset(
-        cls,
-        eval_subset: SubsetImageDepth,
-        train_subset: SubsetImageDepth,
-        crop_size: int,
-        final_label_transform: v2.Lambda,
-        model: ModelType,
-    ):
-        """Construct a tuple of transformed datasets from subsets."""
-        rgb_models = [ModelType.ENET, ModelType.RESNET, ModelType.VIT]
-
-        # TODO: using composition, wrap models in class that retrieves their transformations
-        # then easily grab transforms
-
-        # TODO: evaluate implementing extra transforms
-        extra_tf: list[nn.Module] = [
-            # crop random area
-            v2.RandomResizedCrop(size=crop_size, antialias=True),
-            # flip image with some probability
-            v2.RandomHorizontalFlip(p=0.5),
-            v2.RandomVerticalFlip(p=0.5),
-        ]
-
-        common_tf: list[nn.Module] = [
-            # convert PIL to tensor
-            v2.PILToTensor(),
-            # ToTensor preserves original datatype, this ensures it is proper input type
-            v2.ToDtype(torch.uint8, scale=True),
-            v2.CenterCrop(size=crop_size),
-            # normalize across channels, expects float
-            v2.ToDtype(torch.float32, scale=True),
-        ]
-        if model in rgb_models:
-            logger.debug("Model type requires three input channels, appending extra transform.")
-            # convert to gray before normalization and keep 3 channels for some backbones
-            common_tf.extend(
-                [
-                    v2.Grayscale(num_output_channels=3),
-                    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ]
-            )
-
-        eval_transform: v2.Compose = v2.Compose(common_tf)
-        train_transform: v2.Compose = v2.Compose(extra_tf + common_tf)
-        logger.debug("Train and evaluation transformations composed successfully.")
-
-        # providing the dataset with these transforms will create a new subset
-        # dataset containing the transformed images
-        tf_eval_ds = cls(
-            subset_obj=eval_subset,
-            img_transform=eval_transform,
-            label_transform=final_label_transform,
-        )
-        tf_train_ds = cls(
-            subset_obj=train_subset,
-            img_transform=train_transform,
-            label_transform=final_label_transform,
-        )
-        logger.debug("transformed datasets created")
-        return (tf_eval_ds, tf_train_ds)
-
-
-def transform_ds(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
-    """Split the dataset, apply transforms and build dataloaders."""
-    (train_subset, eval_subset) = a_cfg.setup_loader_indices(base)
-    logger.debug("Train and evaluation subset created successfully")
-    # Calculate avg and std from the training subset's physical z-values
-    # Need to access original z_m from base dataset via indices of train_subset
-    (z_avg, z_std) = base.z.subset_mean_std(subset_indices=train_subset.indices)
-
-    # Define label transforms based on analysis type (handles normalization for REG)
-    if a_cfg.analysis == AnalysisType.REG:
-        # True physical Zs for validation
-        evaluation_metric = base.z.z_array[eval_subset.indices]
-
-        def _reg_label_transform_fn(z_raw: np.float32) -> Tensor:
-            """Pass in physical value, return normalized z tensor."""
-            z_tensor = torch.as_tensor(z_raw, dtype=torch.float32)
-            return (z_tensor - z_avg) / z_std
-
-        # apply local function above to z values to create proper label
-        final_label_transform = v2.Lambda(_reg_label_transform_fn)
-    else:
-        # Physical values of bin centers
-        evaluation_metric = base.z_bins[eval_subset.indices]
-
-        # simply convert to tensor
-        final_label_transform = v2.Lambda(
-            lambda z_raw_idx: torch.as_tensor(z_raw_idx, dtype=torch.long)
-        )
-
-    (train_subset, eval_subset) = TransformedDataset.from_subset(
-        train_subset, eval_subset, a_cfg.crop_size, final_label_transform, a_cfg.backbone
-    )
-
-    # dataset needs to be iterable in terms of pytorch, dataloader does such
-    eval_dl: DataLoader[tuple[ImageType, np.float64]] = DataLoader(
-        eval_subset,
-        batch_size=a_cfg.batch_size,
-        drop_last=True,
-        num_workers=a_cfg.num_workers,
-        pin_memory=(a_cfg.device() == "cuda"),
-        prefetch_factor=2 if a_cfg.num_workers > 0 else None,
-        shuffle=True,
-    )
-    train_dl: DataLoader[tuple[ImageType, np.float64]] = DataLoader(
-        train_subset,
-        batch_size=a_cfg.batch_size,
-        drop_last=True,
-        num_workers=a_cfg.num_workers,
-        pin_memory=(a_cfg.device() == "cuda"),
-        prefetch_factor=2 if a_cfg.num_workers > 0 else None,
-        shuffle=True,
-    )
-    logger.debug("Dataloaders created successfully")
-
-    # reg options: nn.BCEWithLogitsLoss(), nn.MSELoss()
-    loss_fn = nn.CrossEntropyLoss() if a_cfg.analysis == AnalysisType.CLASS else nn.MSELoss()
-    model = a_cfg.create_model()
-
-    # optimizer should only be created after model
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=a_cfg.opt_lr, weight_decay=a_cfg.opt_weight_decay
-    )
-
-    # Scheduler monitors val_metrics[1]: MAE (min) for REG, Accuracy (max) for CLASS
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min" if a_cfg.analysis == AnalysisType.REG else "max",
-        factor=a_cfg.sch_factor,
-        patience=a_cfg.sch_patience,
-    )
-
-    # Create CoreTrainer
-    core_trainer_config = CoreTrainer(
-        evaluation_metric=evaluation_metric,  # This is Arr64 of z_m or bin_centers_m
-        model=model,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        train_ds=train_subset,
-        train_loader=train_dl,
-        val_ds=eval_subset,
-        val_loader=eval_dl,
-        z_std=Q_(z_std, u.m),
-        z_avg=Q_(z_avg, u.m),
-    )
-    console.rule("[black on green] Epoch Variables Initialization Complete ")
-    return core_trainer_config
-
-
 @dataclass
 class TrainProgress:
     best_val: float
@@ -286,25 +89,27 @@ def _check_model_improvement(
     epoch_metric: EpochMetric,
     a_cfg: AutoConfig,
     best_val: float,
+    core_trainer: CoreTrainer,
+    labels_tensor: Tensor,
+    path_to_model: Path,
     epoch: int,
     short_range: int = 3,
     long_range: int = 5,
 ) -> TrainStatus:
     if a_cfg.analysis == AnalysisType.REG:
         # Lower MAE is better
-        best_val_out = epoch_metric.metric_val if epoch_metric.metric_val < best_val else best_val
+        save_best_model_flag = epoch_metric.metric_val < best_val
+        best_val_out = epoch_metric.metric_val if save_best_model_flag else best_val
+        logger.debug(f"At {epoch} / {a_cfg.epoch_count} Val MAE: {epoch_metric.metric_val:.9f} µm")
+    else:
+        # Higher Accuracy is better
+        save_best_model_flag = epoch_metric.metric_val > best_val
+        best_val_out = epoch_metric.metric_val if save_best_model_flag else best_val
         logger.debug(
             f"At {epoch} / {a_cfg.epoch_count} Val Acc: {epoch_metric.metric_val * 100:.2f} %"
         )
-    else:
-        # Higher Accuracy is better
-        best_val_out = epoch_metric.metric_val if epoch_metric.metric_val > best_val else best_val
-        logger.debug(f"At {epoch} / {a_cfg.epoch_count} Val MAE: {epoch_metric.metric_val:.9f} µm")
 
     if epoch > (a_cfg.epoch_count / 5) and epoch >= 10:
-        if epoch_metric.metric_val < best_val_out:
-            save_best_model_flag = True
-
         # get percent diff to measure improvement, desire current < previous
         percent_diff_history = get_percent_diff_history(
             epoch_metric, metric_val_hist, a_cfg.analysis
@@ -326,6 +131,16 @@ def _check_model_improvement(
                 )
                 return None
 
+    # convert best_val_metric form of 5 numbers, in scientific notation
+    # create file with name that is unique to evaluation
+    best_model_name: str = path_to_model.name.removesuffix(".pth") + f"{best_val_out:3e}" + ".pth"
+    path_to_model_detail = path_to_model.parent / Path(best_model_name)
+
+    # check if files in directory has potential amount of
+    # files to reach limit before loop.
+    remove_oldest_checkpoint(path_to_model_detail)
+    checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, a_cfg, best_val_out)
+    checkpoint.torch_save(path_to_model_detail)
     return TrainProgress(best_val_out, save_best_model_flag)
 
 
@@ -414,6 +229,21 @@ def epoch_loop(
             labels_tens = labels_tens.float()  # BCE expects float 0/1
         elif isinstance(core_trainer.loss_fn, nn.CrossEntropyLoss):
             labels_tens = labels_tens.long()
+            # fail fast with a readable error; a mismatch here otherwise surfaces as an
+            # opaque CUDA device-side assert in backward()
+            if pred.ndim != 2 or pred.shape[1] != a_cfg.num_classes:
+                raise ValueError(
+                    f"Model '{a_cfg.backbone.value}' output shape {tuple(pred.shape)} is "
+                    f"incompatible with CrossEntropyLoss over {a_cfg.num_classes} classes; "
+                    "expected (batch, num_classes)."
+                )
+            if labels_tens.numel() > 0 and (
+                int(labels_tens.min()) < 0 or int(labels_tens.max()) >= a_cfg.num_classes
+            ):
+                raise ValueError(
+                    f"Class labels outside [0, {a_cfg.num_classes}): "
+                    f"min {int(labels_tens.min())}, max {int(labels_tens.max())}."
+                )
         else:
             raise Exception(f"Loss function is unknown: {core_trainer.loss_fn}")
 
@@ -489,22 +319,30 @@ class Checkpoint:
     """Serialized training state used for resuming."""
 
     epoch: int
-    model_statedict: StateDict
+    model_state_dict: StateDict
     labels: torch.Tensor
-    bin_centers: Arr32 | None
+    bin_centers: Arr64 | None
     num_classes: int
     val_metric: float
     model_type: ModelType
+    # z-label normalization stats (regression only); None on classification
+    # checkpoints and on checkpoints written before these fields existed
+    z_avg: float | None = None
+    z_std: float | None = None
 
     @classmethod
     def from_dict(cls, torch_dict: dict[str, Any]) -> Checkpoint:
+        """Rebuild a checkpoint from the dictionary written by torch_save."""
         return cls(
             epoch=torch_dict["epoch"],
-            model_statedict=torch_dict["model_state_dict"],
+            model_state_dict=torch_dict["model_state_dict"],
             labels=torch_dict["labels"],
             val_metric=torch_dict["val_metric"],
             bin_centers=torch_dict["bin_centers"],
-            num_classes=torch_dict["num_bins"],
+            num_classes=torch_dict["num_classes"],
+            model_type=torch_dict["model_type"],
+            z_avg=torch_dict.get("z_avg"),
+            z_std=torch_dict.get("z_std"),
         )
 
     @classmethod
@@ -516,15 +354,19 @@ class Checkpoint:
         a_cfg: AutoConfig,
         val_metric: float,
     ) -> Checkpoint:
-        cls(
+        """Build a checkpoint from the current epoch's training state."""
+        (z_avg, z_std) = core_trainer.get_std_avg(a_cfg.analysis)
+        return cls(
             epoch=epoch,
-            model_statedict=core_trainer.model.state_dict(),
+            model_state_dict=core_trainer.model.state_dict(),
             labels=labels_tensor,
-            val_metric=getattr(core_trainer.train_loader, "bin_centers", None),
-            bin_centers=a_cfg.bin_centers,
+            val_metric=val_metric,
+            bin_centers=core_trainer.bin_centers,
             num_classes=a_cfg.num_classes,
+            model_type=a_cfg.backbone,
+            z_avg=float(z_avg) if z_avg is not None else None,
+            z_std=float(z_std) if z_std is not None else None,
         )
-        pass
 
     def torch_save(self, path) -> None:
         torch.save(
@@ -538,9 +380,19 @@ class ModelCheckpoint:
     """Serialized training state used for models."""
 
     checkpoint: Checkpoint
-    optimizer_statedict: StateDict
+    optimizer_state_dict: StateDict
     train_loss: float
     val_loss: float
+
+    # torch.load(weights_only=True) only unpickles allowlisted types; besides tensors
+    # and primitives, the saved dict holds a ModelType enum and numpy bin_centers.
+    SAFE_GLOBALS: ClassVar[list[Any]] = [
+        ModelType,
+        np.ndarray,
+        np.dtype,
+        np.dtypes.Float64DType,
+        np._core.multiarray._reconstruct,  # numpy's ndarray pickle helper  # pyright: ignore[reportAttributeAccessIssue]
+    ]
 
     @classmethod
     def from_epoch(
@@ -550,7 +402,7 @@ class ModelCheckpoint:
         labels_tensor,
         a_cfg: AutoConfig,
         val_metric: float,
-        optimizer_statedict: StateDict,
+        optimizer_state_dict: StateDict,
         train_loss: float,
         val_loss: float,
     ) -> ModelCheckpoint:
@@ -558,7 +410,7 @@ class ModelCheckpoint:
         checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, a_cfg, val_metric)
         return cls(
             checkpoint=checkpoint,
-            optimizer_state_dict=core_trainer.optimizer.state_dict(),
+            optimizer_state_dict=optimizer_state_dict,
             train_loss=train_loss,
             val_loss=val_loss,
         )
@@ -568,22 +420,29 @@ class ModelCheckpoint:
         cls, path_ckpt: str, optimizer: Optimizer, model: nn.Module, device: str
     ) -> ModelCheckpoint:
         """Load a training checkpoint, restore optimizer and model state."""
-        torch_dict: dict[str, Any] = torch.load(path_ckpt, weights_only=True, map_location=device)
-        checkpoint = Checkpoint.from_dict(torch_dict)
-        # returns unexepected keys or missing keys for the model if either case occurs
-        missing_keys = model.load_state_dict()
+        with torch.serialization.safe_globals(cls.SAFE_GLOBALS):
+            torch_dict: dict[str, Any] = torch.load(
+                path_ckpt, weights_only=True, map_location=device
+            )
+        checkpoint = Checkpoint.from_dict(torch_dict["checkpoint"])
+        # returns unexpected keys or missing keys for the model if either case occurs
+        incompatible = model.load_state_dict(checkpoint.model_state_dict)
         # must move model onto expected device before loading optimiser
         _ = model.to(device)
-        if len(missing_keys) > 0:
-            logger.info(f"{missing_keys}")
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            logger.warning(f"State dict load mismatch: {incompatible}")
 
         ckpt: ModelCheckpoint = cls(
             checkpoint=checkpoint,
-            optimizer_statedict=torch_dict["optimizer_state_dict"],
+            optimizer_state_dict=torch_dict["optimizer_state_dict"],
             train_loss=torch_dict["train_loss"],
             val_loss=torch_dict["val_loss"],
         )
-        optimizer.load_state_dict(ckpt.optimizer_statedict)
+        optimizer.load_state_dict(ckpt.optimizer_state_dict)
+        logger.info(
+            f"Resumed from checkpoint {path_ckpt} "
+            + f"(epoch {checkpoint.epoch}, val_metric {checkpoint.val_metric:.4g})"
+        )
 
         return ckpt
 
@@ -594,8 +453,29 @@ class ModelCheckpoint:
         )
 
 
+def init_training(a_cfg: AutoConfig, ckpt: ModelCheckpoint | None):
+    if ckpt is None:
+        labels_tensor: Tensor = torch.empty([1, 1])
+        epoch_metric: EpochMetric = EpochMetric(metric_val=0)
+        avg_loss_train: float = 0
+        avg_loss_val: float = 0
+    else:
+        labels_tensor = ckpt.checkpoint.labels.to(a_cfg.device())
+        epoch_metric = EpochMetric(ckpt.checkpoint.val_metric)
+        avg_loss_train = ckpt.train_loss
+        avg_loss_val = ckpt.val_loss
+
+    # Paths
+    checkpoint_dir = checkpoints_loc()
+    checkpoint_dir.mkdir(exist_ok=True)
+    return checkpoint_dir, labels_tensor, epoch_metric, avg_loss_train, avg_loss_val
+
+
 def train_eval_epoch(
-    core_trainer: CoreTrainer, a_cfg: AutoConfig, best_val_metric: float, ckpt: Checkpoint | None
+    core_trainer: CoreTrainer,
+    a_cfg: AutoConfig,
+    best_val_metric: float,
+    ckpt: ModelCheckpoint | None,
 ) -> TrainingOutput:
     """Trains model over one epoch.
 
@@ -603,15 +483,10 @@ def train_eval_epoch(
         float: Average loss of the model after epoch completes.
 
     """
-    labels_tensor: Tensor = torch.empty([1, 1]) if ckpt is None else ckpt.l_tens.to(a_cfg.device())
-    epoch_metric: EpochMetric = EpochMetric(metric_val=0 if ckpt is None else ckpt.val_metric)
-    avg_loss_train: float = 0 if ckpt is None else ckpt.train_loss
-    avg_loss_val: float = 0 if ckpt is None else ckpt.val_loss
+    checkpoint_dir, labels_tensor, epoch_metric, avg_loss_train, avg_loss_val = init_training(
+        a_cfg, ckpt
+    )
     metric_val_hist: list[float] = []
-
-    # Paths
-    checkpoint_dir = checkpoints_loc()
-    checkpoint_dir.mkdir(exist_ok=True)
 
     path_to_checkpoint: Path = checkpoint_dir / Path("latest_checkpoint.tar")
     path_to_model: Path = checkpoint_dir / Path(f"checkpoint_{a_cfg.backbone.name}.pth")
@@ -647,28 +522,19 @@ def train_eval_epoch(
 
             # store metric val from epochs previous
             metric_val_hist.append(epoch_metric.metric_val)
+            # -- Save best checkpoint, if metric is better ---------------------------------------
             train_status = _check_model_improvement(
-                metric_val_hist, epoch_metric, a_cfg, best_val_metric, epoch
+                metric_val_hist,
+                epoch_metric,
+                a_cfg,
+                best_val_metric,
+                core_trainer,
+                labels_tensor,
+                path_to_model,
+                epoch,
             )
             if train_status is None:
                 break
-            # -- Save best checkpoint, if metric is better ---------------------------------------
-            if train_status.save_best:
-                best_val_metric = train_status.best_val
-                # convert best_val_metric form of 5 numbers, in scientific notation
-                # create file with name that is unique to evaluation
-                best_model_name: str = (
-                    path_to_model.name.removesuffix(".pth") + f"{best_val_metric:3e}" + ".pth"
-                )
-                path_to_model_detail = path_to_model.parent / Path(best_model_name)
-
-                # check if files in directory has potential amount of
-                # files to reach limit before loop.
-                remove_oldest_checkpoint(path_to_model_detail)
-                checkpoint = Checkpoint.from_epoch(
-                    epoch, core_trainer, labels_tensor, a_cfg, best_val_metric
-                )
-                checkpoint.torch_save(path_to_model_detail)
 
             # Always save latest model, after going through both loaders
             model_checkpoint = ModelCheckpoint.from_epoch(
@@ -677,11 +543,11 @@ def train_eval_epoch(
                 labels_tensor,
                 a_cfg,
                 best_val_metric,
-                core_trainer.optimizer.state_dict,
+                core_trainer.optimizer.state_dict(),
                 avg_loss_train,
                 avg_loss_val,
             )
-            model_checkpoint.torch_save(path_to_model_detail)
+            model_checkpoint.torch_save(path_to_checkpoint)
 
             progress_bar.update(
                 epoch_task,
@@ -716,7 +582,6 @@ def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotP
             path_ckpt, train_cfg.optimizer, train_cfg.model, a_config.device()
         )
         best_val_metric = ckpt.checkpoint.val_metric
-        bin_centers = ckpt.checkpoint.bin_centers
     else:
         # For measuring evaluation: classificaton is maximizing correct bins,
         # regression is minimizing the error from expected

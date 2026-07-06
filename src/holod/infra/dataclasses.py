@@ -5,32 +5,38 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, override
 
 import click
+import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
+from PIL.Image import Image as ImageType
 from serde import Untagged, serde
 from timm import create_model
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import models
+from torchvision.transforms import v2
 
 import holod.infra.util.paths as paths
 from holod.infra.dataset import HologramFocusDataset
 from holod.infra.log import get_logger
 from holod.infra.util.types import (
+    Q_,
     AnalysisType,
     CreateCSVOption,
     Mean,
     ModelType,
     StandardDev,
+    SubsetImageDepth,
     SubsetList,
     UserDevice,
+    u,
 )
 
 if TYPE_CHECKING:
-    import numpy as np
     import numpy.typing as npt
-    from PIL.Image import Image as ImageType
     from pint.facets.plain.quantity import PlainQuantity
     from torch.nn import Module
     from torch.optim import Optimizer
@@ -158,9 +164,9 @@ class AutoConfig:
                     num_classes=num_model_outputs,
                 )
             case ModelType.FOCUSNET:
-                model = FocusNetTorch()
+                model = FocusNetTorch(num_classes=num_model_outputs)
             case _:
-                raise Exception(f"Could not create model specified: {self.backbone}")
+                raise Exception(f"Could not create model specified: {self.backbone}")  # pyright: ignore[reportUnreachable]
         logger.info(
             f"Model '{self.backbone.value}' configured with {num_model_outputs} output "
             + f"features for {self.analysis.value} analysis."
@@ -217,7 +223,6 @@ class AutoConfig:
         sch_patience: int | None,
     ) -> AutoConfig:
         """Parse user input to ensure proper arguments are recieved."""
-
         if backbone is None:
             logger.error("No backbone passed, using efficientnet.")
             backbone = "Enet"
@@ -456,6 +461,7 @@ class CoreTrainer:
     """Class to hold specifically all the training information."""
 
     evaluation_metric: npt.NDArray[np.float64] | npt.NDArray[np.intp]
+    bin_centers: npt.NDArray[np.float64] | None
     model: Module
     loss_fn: Any
     optimizer: Optimizer
@@ -559,14 +565,6 @@ def fft_mag2d(x: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
     return mag.real  # still real
 
 
-def holo_activation(
-    d: torch.Tensor, target_min: float = 0.1, target_max: float = 10.0
-) -> torch.Tensor:
-    """Port of the Keras helper: tanh -> [target_min, target_max]."""
-    scale = (target_max - target_min) / 2.0
-    return torch.tanh(d) * scale + (target_min + scale)
-
-
 def make_input_2ch(holod: torch.Tensor, use_fft: bool = True) -> torch.Tensor:
     """Build the 2‑channel input described in the repo's Fourier2D layer.
 
@@ -599,26 +597,26 @@ class ConvBlock(nn.Module):
 
 
 class FocusNetTorch(nn.Module):
-    """Compact CNN regressor for DLHM depth, inspired by the TF/Keras FocusNET repo:
-    - Input: 2 channels [holod, |FFT(holod)|]
-    - Output: scalar depth (microns or mm depending on dataset), post‑processed by holo_activation.
+    """Compact CNN for DLHM depth, inspired by the TF/Keras FocusNET repo.
+
+    - Input: (N, 1, H, W) hologram; expanded to 2 channels [holod, |FFT(holod)|] internally.
+    - Output: (N, num_classes) logits for classification, or (N, 1) normalized depth
+      for regression (num_classes=1), matching the other backbones.
     """
 
     def __init__(
         self,
-        in_channels: int = 3,
+        num_classes: int = 1,
         width: int = 32,
-        img_size: tuple[int, int] = (256, 256),
-        target_min: float = 0.1,
-        target_max: float = 10.0,
+        use_fft: bool = True,
         head: Literal["mlp", "linear"] = "mlp",
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        H, W = img_size
+        self.use_fft = use_fft
 
-        # Feature extractor
-        self.stem = ConvBlock(in_channels, width, k=3)
+        # Feature extractor; stem sees the 2-channel input built in forward()
+        self.stem = ConvBlock(2, width, k=3)
         self.layer1 = nn.Sequential(
             ConvBlock(width, width, k=3),
             ConvBlock(width, width, k=3),
@@ -644,30 +642,241 @@ class FocusNetTorch(nn.Module):
                 nn.Linear(emb_dim, emb_dim // 2),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout),
-                nn.Linear(emb_dim // 2, 1),
+                nn.Linear(emb_dim // 2, num_classes),
             )
         else:
-            self.head = nn.Sequential(nn.Flatten(), nn.Linear(emb_dim, 1))
+            self.head = nn.Sequential(nn.Flatten(), nn.Linear(emb_dim, num_classes))
 
-        # Save activation bounds
-        self.target_min = float(target_min)
-        self.target_max = float(target_max)
-
-    @torch.inference_mode(False)
-    def forward(self, x2: torch.Tensor) -> torch.Tensor:
-        """Args:
-            x2: (N, 2, H, W) already‑prepared input (see make_input_2ch).
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the network on a (N, 1, H, W) real hologram.
 
         Returns:
-            (N, 1) depth in target range via holo_activation.
+            (N, num_classes) raw logits (classification) or values (regression).
 
         """
-        x = self.stem(x2)
+        x = make_input_2ch(x, use_fft=self.use_fft)
+        x = self.stem(x)
         x = self.layer1(x)
         x = self.down1(x)
         x = self.layer2(x)
         x = self.down2(x)
         x = self.layer3(x)
         x = self.pool(x)
-        x = self.head(x)  # (N,1)
-        return holo_activation(x, self.target_min, self.target_max)
+        return self.head(x)
+
+
+# Label transforms must be picklable so DataLoader workers (spawn on Windows)
+# can serialize the dataset; locals/lambdas inside transform_ds break that.
+@dataclass
+class RegLabelTransform:
+    """Normalize a physical z-value into a float tensor using training-set stats."""
+
+    z_avg: float
+    z_std: float
+
+    def __call__(self, z_raw: np.float32) -> Tensor:
+        """Pass in physical value, return normalized z tensor."""
+        z_tensor = torch.as_tensor(z_raw, dtype=torch.float32)
+        return (z_tensor - self.z_avg) / self.z_std
+
+
+def class_label_transform(z_raw_idx: np.int64) -> Tensor:
+    """Convert a bin index into a long tensor."""
+    return torch.as_tensor(z_raw_idx, dtype=torch.long)
+
+
+class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
+    """Transform the input dataset by applying transfomations to it's contents.
+
+    By wrapping the underlying dataset in this class, we can ensure that attrbutes
+    retrived from this new object will undergo the expected transfomrmations while
+    preserving the original data.
+
+    Attributes:
+        subset_obj: Subset[tuple[ImageType, np.float64]] Subset of the original
+                    dataset.
+        img_transform: v2.Compose | None  Transformation(s) to be applied to images.
+        label_transform: v2.Lambda | None Transformation(s) to be applied to labels.
+
+    """
+
+    def __init__(
+        self,
+        subset_obj: SubsetImageDepth,
+        img_transform: v2.Compose | None = None,
+        label_transform: v2.Lambda | None = None,
+    ) -> None:
+        """Initialize the wrapper with optional image and label transforms."""
+        # NOTE: v2 transformation classes != typical torch transformation classes
+        self.subset_obj: SubsetImageDepth = subset_obj
+        self.img_transform: v2.Compose | None = img_transform
+        self.label_transform: v2.Lambda | None = label_transform
+
+    @override
+    def __getitem__(self, idx: int) -> tuple[Any | ImageType, Any | np.float64]:
+        """Retrieve the image and label from the subest object."""
+        img, label = self.subset_obj[idx]  # Gets (PIL Image, raw_label)
+
+        if self.img_transform:
+            img = self.img_transform(img)
+        if self.label_transform:
+            label = self.label_transform(label)
+        return img, label
+
+    def __len__(self):
+        """Get number of entries in subset."""
+        return len(self.subset_obj)
+
+    @classmethod
+    def from_subset(
+        cls,
+        eval_subset: SubsetImageDepth,
+        train_subset: SubsetImageDepth,
+        crop_size: int,
+        final_label_transform: v2.Lambda,
+        model: ModelType,
+    ):
+        """Construct a tuple of transformed datasets from subsets."""
+        rgb_models = [ModelType.ENET, ModelType.RESNET, ModelType.VIT]
+
+        # TODO: using composition, wrap models in class that retrieves their transformations
+        # then easily grab transforms
+
+        # TODO: evaluate implementing extra transforms
+        extra_tf: list[nn.Module] = [
+            # crop random area
+            v2.RandomResizedCrop(size=crop_size, antialias=True),
+            # flip image with some probability
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomVerticalFlip(p=0.5),
+        ]
+
+        common_tf: list[nn.Module] = [
+            # convert PIL to tensor
+            v2.PILToTensor(),
+            # ToTensor preserves original datatype, this ensures it is proper input type
+            v2.ToDtype(torch.uint8, scale=True),
+            v2.CenterCrop(size=crop_size),
+            # normalize across channels, expects float
+            v2.ToDtype(torch.float32, scale=True),
+        ]
+        if model in rgb_models:
+            logger.debug("Model type requires three input channels, appending extra transform.")
+            # convert to gray before normalization and keep 3 channels for some backbones
+            common_tf.extend(
+                [
+                    v2.Grayscale(num_output_channels=3),
+                    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ]
+            )
+        else:
+            logger.debug("Model type requires one input channel, appending grayscale transform.")
+            # custom nets (NEW, FOCUSNET) take a single-channel hologram
+            common_tf.append(v2.Grayscale(num_output_channels=1))
+
+        eval_transform: v2.Compose = v2.Compose(common_tf)
+        train_transform: v2.Compose = v2.Compose(extra_tf + common_tf)
+        logger.debug("Train and evaluation transformations composed successfully.")
+
+        # providing the dataset with these transforms will create a new subset
+        # dataset containing the transformed images
+        tf_eval_ds = cls(
+            subset_obj=eval_subset,
+            img_transform=eval_transform,
+            label_transform=final_label_transform,
+        )
+        tf_train_ds = cls(
+            subset_obj=train_subset,
+            img_transform=train_transform,
+            label_transform=final_label_transform,
+        )
+        logger.debug("transformed datasets created")
+        return (tf_train_ds, tf_eval_ds)
+
+
+def transform_ds(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
+    """Split the dataset, apply transforms and build dataloaders."""
+    (train_subset, eval_subset) = a_cfg.setup_loader_indices(base)
+    logger.debug("Train and evaluation subset created successfully")
+    # Calculate avg and std from the training subset's physical z-values
+    # Need to access original z_m from base dataset via indices of train_subset
+    (z_avg, z_std) = base.z.subset_mean_std(subset_indices=train_subset.indices)
+
+    # Define label transforms based on analysis type (handles normalization for REG)
+    evaluation_metric: npt.NDArray[np.float64] | npt.NDArray[np.intp]
+    if a_cfg.analysis == AnalysisType.REG:
+        # True physical Zs for validation
+        evaluation_metric = base.z.z_array[eval_subset.indices]
+
+        # normalize z values to create proper label
+        final_label_transform = v2.Lambda(RegLabelTransform(z_avg=float(z_avg), z_std=float(z_std)))
+    else:
+        # Physical values of bin centers
+        evaluation_metric = base.z_bins[eval_subset.indices]
+
+        # simply convert to tensor
+        final_label_transform = v2.Lambda(class_label_transform)
+
+    (train_subset, eval_subset) = TransformedDataset.from_subset(
+        eval_subset=eval_subset,
+        train_subset=train_subset,
+        crop_size=a_cfg.crop_size,
+        final_label_transform=final_label_transform,
+        model=a_cfg.backbone,
+    )
+
+    # dataset needs to be iterable in terms of pytorch, dataloader does such
+    eval_dl: DataLoader[tuple[ImageType, np.float64]] = DataLoader(
+        eval_subset,
+        batch_size=a_cfg.batch_size,
+        drop_last=False,
+        num_workers=a_cfg.num_workers,
+        pin_memory=(a_cfg.device() == "cuda"),
+        prefetch_factor=2 if a_cfg.num_workers > 0 else None,
+        shuffle=False,
+    )
+    train_dl: DataLoader[tuple[ImageType, np.float64]] = DataLoader(
+        train_subset,
+        batch_size=a_cfg.batch_size,
+        drop_last=True,
+        num_workers=a_cfg.num_workers,
+        pin_memory=(a_cfg.device() == "cuda"),
+        prefetch_factor=2 if a_cfg.num_workers > 0 else None,
+        shuffle=True,
+    )
+    logger.debug("Dataloaders created successfully")
+
+    # reg options: nn.BCEWithLogitsLoss(), nn.MSELoss()
+    loss_fn = nn.CrossEntropyLoss() if a_cfg.analysis == AnalysisType.CLASS else nn.MSELoss()
+    model = a_cfg.create_model()
+
+    # optimizer should only be created after model
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=a_cfg.opt_lr, weight_decay=a_cfg.opt_weight_decay
+    )
+
+    # Scheduler monitors val_metrics[1]: MAE (min) for REG, Accuracy (max) for CLASS
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min" if a_cfg.analysis == AnalysisType.REG else "max",
+        factor=a_cfg.sch_factor,
+        patience=a_cfg.sch_patience,
+    )
+
+    # Create CoreTrainer
+    core_trainer_config = CoreTrainer(
+        evaluation_metric=evaluation_metric,  # This is Arr64 of z_m or bin_centers_m
+        bin_centers=base.bin_centers if a_cfg.analysis == AnalysisType.CLASS else None,
+        model=model,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        train_ds=train_subset,
+        train_loader=train_dl,
+        val_ds=eval_subset,
+        val_loader=eval_dl,
+        z_std=Q_(z_std, u.m),
+        z_avg=Q_(z_avg, u.m),
+    )
+    logger.info("Hyperparameter Initialization Complete ")
+    return core_trainer_config
