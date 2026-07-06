@@ -38,7 +38,7 @@ def cli():
     "--model",
     "backbone",
     default=None,
-    type=click.Choice(["efficientnet", "vit", "resnet50"]),
+    type=click.Choice(["efficientnet", "vit", "resnet50", "focusnet", "new"]),
     help="Model backbone name.",
 )
 @click.option(
@@ -84,7 +84,13 @@ def cli():
     help="Device for training.",
 )
 @click.option("--fixed-seed", "fixed_seed", default=None, help="Keep the random seed consistent.")
-@click.option("--continue", "continue_train", default=None, help="Continue from checkpoint")
+@click.option(
+    "--continue",
+    "continue_train",
+    is_flag=True,
+    default=None,
+    help="Continue from checkpoint",
+)
 @click.option("--create-csv", "create_csv", default=None, help="Create a CSV for data.")
 @click.option("--sample", "use_sample_data", default=None, help="Use sample data provided.")
 def train(
@@ -119,7 +125,7 @@ def train(
     # maybe prompt the user to utilize sample?
 
     autofocus_config: AutoConfig
-    path_ckpt: str | None
+    path_ckpt: str | None = None
     if Path("train_settings.toml").exists():
         with open("train_settings.toml") as config_file:
             config = config_file.read()
@@ -143,11 +149,12 @@ def train(
             ),
             flags=Flags(continue_train, create_csv, fixed_seed, use_sample_data),
         )
-        path_ckpt = (
-            checkpoints_loc().as_posix()
-            if (config.flags.checkpoint or continue_train) is True
-            else None
-        )
+        if (config.flags.checkpoint or continue_train) is True:
+            latest_ckpt = checkpoints_loc() / "latest_checkpoint.tar"
+            if latest_ckpt.exists():
+                path_ckpt = latest_ckpt.as_posix()
+            else:
+                logger.warning(f"No checkpoint found at {latest_ckpt}, starting fresh.")
         autofocus_config = config.to_auto_config()
 
     else:
@@ -164,6 +171,218 @@ def train(
     with open(report_path() / "plot_info.json", "w", encoding="utf-8") as f:
         plot_info_json = to_json(plot_info, PlotPred)
         f.write(plot_info_json)
+
+
+@cli.command()
+@click.option(
+    "--model",
+    "models",
+    multiple=True,
+    type=click.Choice(["efficientnet", "vit", "resnet50", "focusnet", "new"]),
+    help="Backbone to include; repeat for several. Defaults to all backbones.",
+)
+@click.option(
+    "--bins",
+    "num_classes",
+    default=None,
+    type=click.IntRange(1, 100),
+    help="Number of classifications, set to 1 for regression training.",
+)
+@click.option(
+    "--crop",
+    "crop_size",
+    default=None,
+    type=click.IntRange(20, 516),
+    help="Size to crop images to.",
+)
+@click.option(
+    "--batch",
+    "batch_size",
+    default=None,
+    type=click.IntRange(1, 64),
+    help="Training batch size.",
+)
+@click.option(
+    "--ep",
+    "epoch_count",
+    default=None,
+    type=click.IntRange(1, 1000),
+    help="Number of training epochs per backbone.",
+)
+@click.option(
+    "--lr",
+    "learning_rate",
+    default=None,
+    type=click.FloatRange(1e-6, 1e2),
+    help="How fast should the model adapt epoch to epoch",
+)
+@click.option(
+    "--device",
+    "device_user",
+    default=None,
+    type=click.Choice(["cuda", "cpu"]),
+    help="Device for training.",
+)
+@click.option("--sample", "use_sample_data", default=None, help="Use sample data provided.")
+@click.option(
+    "--skip-train",
+    "skip_train",
+    is_flag=True,
+    default=False,
+    help="Only report architecture and inference statistics; skip training.",
+)
+def compare(
+    models: tuple[str, ...],
+    num_classes: int | None,
+    crop_size: int | None,
+    batch_size: int | None,
+    epoch_count: int | None,
+    learning_rate: float | None,
+    device_user: str | None,
+    use_sample_data: bool | None,
+    skip_train: bool,
+) -> None:
+    """Compare each model backbone under one shared configuration."""
+    from serde.toml import from_toml
+
+    from holod.core.compare import compare_backbones
+    from holod.infra.dataclasses import AutoConfig, Flags, Paths, Train, UserConfig
+    from holod.infra.log import console_ as console
+    from holod.infra.util.types import AnalysisType, ModelType, UserDevice
+
+    selected = [ModelType(m) for m in models] if models else None
+
+    autofocus_config: AutoConfig
+    if skip_train:
+        # static statistics need no dataset; build the config directly from CLI values
+        overrides: dict[str, Any] = {
+            key: value
+            for key, value in {
+                "num_classes": num_classes,
+                "crop_size": crop_size,
+                "batch_size": batch_size,
+                "epoch_count": epoch_count,
+                "opt_lr": learning_rate,
+            }.items()
+            if value is not None
+        }
+        if device_user is not None:
+            overrides["device_user"] = UserDevice(device_user)
+        if num_classes is not None:
+            overrides["analysis"] = AnalysisType.CLASS if num_classes != 1 else AnalysisType.REG
+        autofocus_config = AutoConfig(**overrides)
+    elif Path("train_settings.toml").exists():
+        with open("train_settings.toml") as config_file:
+            config = from_toml(UserConfig, config_file.read())
+        # merge the config file with CLI args; non-None CLI values win
+        config.merge(
+            paths=Paths(None, None),
+            train=Train(
+                None,
+                batch_size,
+                crop_size,
+                device_user,
+                epoch_count,
+                learning_rate,
+                num_classes,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            flags=Flags(None, None, None, use_sample_data),
+        )
+        autofocus_config = config.to_auto_config()
+    else:
+        logger.error(
+            "Config file not found, expected 'train_settings.toml' in repo root. Using \
+        default settings."
+        )
+        autofocus_config = AutoConfig()
+
+    report = compare_backbones(autofocus_config, backbones=selected, run_training=not skip_train)
+    console.print(report.to_table())
+    report.save()
+
+
+@cli.command()
+@click.argument("img_file_path")
+@click.option(
+    "--model-path",
+    "model_paths",
+    multiple=True,
+    type=click.Path(dir_okay=False),
+    help="Checkpoint to evaluate; repeat for several. Defaults to every model in src/checkpoints.",
+)
+@click.option(
+    "--runs",
+    default=5,
+    type=click.IntRange(1, 1000),
+    help="Repeated predictions to time per model.",
+)
+@click.option("--crop_size", default=224, help="Pixel width and height to center-crop input to")
+@click.option(
+    "--wavelength", default=530e-9, help="Wavelength of light used to capture the image (m)"
+)
+@click.option("--dx", default=1e-6, help="Size of image px (m)")
+@click.option(
+    "--z-true",
+    "z_true_mm",
+    default=None,
+    type=float,
+    help="Ground-truth depth (mm); enables ranking models by absolute error.",
+)
+@click.option(
+    "--device",
+    default=None,
+    type=click.Choice(["cuda", "cpu"]),
+    help="Device for evaluation.",
+)
+@click.option(
+    "--display",
+    default="save",
+    type=click.Choice(["save", "show", "both"]),
+    help="Save the depth-prediction plot, show it, or both.",
+)
+def compare_holo(
+    img_file_path: str,
+    model_paths: tuple[str, ...],
+    runs: int,
+    crop_size: int,
+    wavelength: float,
+    dx: float,
+    z_true_mm: float | None,
+    device: str | None,
+    display: str,
+) -> None:
+    """Run comparison test evaluations of trained models on a single hologram."""
+    from holod.core.compare import compare_on_hologram
+    from holod.infra.log import console_ as console
+    from holod.infra.util.types import DisplayType
+
+    ckpt_paths: list[Path] | None = None
+    if model_paths:
+        # resolve bare filenames against the checkpoints directory
+        ckpt_paths = [
+            path if path.exists() else checkpoints_loc() / path
+            for path in (Path(m) for m in model_paths)
+        ]
+    path_check({"img_file_path": Path(img_file_path)})
+
+    report = compare_on_hologram(
+        img_file_path,
+        ckpt_paths=ckpt_paths,
+        runs=runs,
+        crop_size=crop_size,
+        wavelength=wavelength,
+        dx=dx,
+        z_true_mm=z_true_mm,
+        device=device,
+    )
+    console.print(report.to_table())
+    report.save()
+    report.plot(DisplayType(display))
 
 
 @cli.command()
@@ -188,9 +407,8 @@ def plot_train(
     display_check = DisplayType(display)
     logger.info(f"Plotting function with option: {display}")
 
-    meta_list: list[str] = []
+    meta_list: list[dict[str, Any]] = []
     # TODO: automatically get analysis type
-    print(plot_info.analysis)
     if plot_info.analysis == AnalysisType.CLASS.value:
         cls_res_cm = plot_info.plot_classification(display_check)
         if cls_res_cm is not None:
@@ -219,7 +437,6 @@ def plot_train(
 @click.option(
     "--wavelength", default=530e-9, help="Wavelength of light used to capture the image (m)"
 )
-@click.option("--z", default=20e-3, help="Distance of measurement (m)")
 @click.option("--dx", default=1e-6, help="Size of image px (m)")
 @click.option(
     "--display",
@@ -231,14 +448,13 @@ def reconstruction(
     model_path: str | Path,
     crop_size: int,
     wavelength: float,
-    z: float,
     dx: float,
     display: str,
     amp_true: None | npt.NDArray[Any],
     phase_true: None | npt.NDArray[Any],
 ):
     """Perform reconstruction on an hologram."""
-    import holod.core.plots as plots  # performance reasons, import locally in function
+    import holod.core.plots as plots
     from holod.infra.util.types import DisplayType
 
     DEF_IMG_FILE_PATH = (data_spec("mw") / "510" / "10_Phase_USAF" / "z10" / "10.jpg").as_posix()
