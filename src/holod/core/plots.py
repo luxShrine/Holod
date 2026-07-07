@@ -19,7 +19,6 @@ import torch.nn as nn
 from matplotlib.figure import Figure
 from plotly.subplots import make_subplots
 from polars import DataFrame
-from rich.progress import track
 from scipy.stats import gaussian_kde
 from serde import serde
 from serde.json import to_json
@@ -28,6 +27,7 @@ from sklearn.metrics import confusion_matrix
 from holod.infra.dataclasses import AutoConfig, CoreTrainer, TrainingRepeatConfig
 from holod.infra.log import get_logger
 from holod.infra.util.paths import report_path
+from holod.infra.util.prog_helper import track_progress
 from holod.infra.util.types import AnalysisType, Arr64, DisplayType, Plots
 
 if TYPE_CHECKING:
@@ -408,7 +408,7 @@ class PlotPred:
             # np.digitize with n_bins points creates n_bins-1 intervals.
             # Iterating from 1 to len(bins_np) (or n_bins) means checking indices 1 to
             # n_bins-1 based on digitize's output.
-            for i in track(range(1, len(bins_np)), description="Bin checking (Plotly)..."):
+            for i in track_progress(range(1, len(bins_np)), description="Bin checking (Plotly)..."):
                 mask: np.intp = bin_idx == i
                 if mask.any():  # at least one sample in the bin
                     mu_list.append(res[mask].mean())
@@ -572,7 +572,7 @@ class PlotPred:
 
         with torch.no_grad():
             for loader in [train_cfg.train_loader, train_cfg.val_loader]:
-                for imgs, labels in track(
+                for imgs, labels in track_progress(
                     loader, f"Gathering z predictions using {auto_config.device()}..."
                 ):
                     # non_blocking means allowing for multiple tensors to be sent to device

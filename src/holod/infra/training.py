@@ -18,11 +18,10 @@ from holod.infra.util.types import (
 )
 
 if TYPE_CHECKING:
-    from rich.progress import (
-        Progress,
-        TaskID,
-    )
+    from rich.progress import TaskID
     from torch.optim import Optimizer
+
+    from holod.infra.util.prog_helper import ProgressLike
 
 from holod.core.plots import PlotPred, TrainingRepeatConfig
 from holod.infra.dataclasses import (
@@ -180,7 +179,11 @@ def get_percent_diff_history(
 
 
 def epoch_loop(
-    a_cfg: AutoConfig, core_trainer: CoreTrainer, progress_bar: Progress, task_id: TaskID, step: str
+    a_cfg: AutoConfig,
+    core_trainer: CoreTrainer,
+    progress_bar: ProgressLike,
+    task_id: TaskID,
+    step: str,
 ) -> EpochMetric:
     """Do one loop of evaluation and training."""
     device = torch.device("cpu") if a_cfg.device() == "cpu" else torch.device("cuda")
@@ -512,8 +515,10 @@ def train_eval_epoch(
 
     path_to_checkpoint: Path = checkpoint_dir / Path("latest_checkpoint.tar")
     path_to_model: Path = checkpoint_dir / Path(f"checkpoint_{a_cfg.backbone.name}.pth")
+    # querying the CUDA device name raises on CPU-only hosts (e.g. a Colab CPU runtime)
+    device_name = torch.cuda.get_device_name() if a_cfg.device() == "cuda" else "cpu"
     progress_bar, train_task, val_task, epoch_task = setup_training_progress(
-        a_cfg, avg_loss_train, avg_loss_val, core_trainer, torch.cuda.get_device_name()
+        a_cfg, avg_loss_train, avg_loss_val, core_trainer, device_name
     )
 
     _ = core_trainer.model.train()

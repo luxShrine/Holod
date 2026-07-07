@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto
-from typing import Any, NewType, TypeVar
+from typing import TYPE_CHECKING, Any, NewType, TypeVar
 
 import numpy as np
 import numpy.typing as npt
 import pint
-import plotly.graph_objects as go
-from matplotlib.figure import Figure
 from PIL.Image import Image as ImageType
 from torch.utils.data import Subset
 
 from holod.infra.log import get_logger
+
+if TYPE_CHECKING:
+    # heavy plotting deps stay import-free at runtime: `type` aliases are lazily
+    # evaluated, and eagerly importing matplotlib crashes in notebook subprocesses
+    # whose MPLBACKEND names a backend module this venv doesn't have
+    import plotly.graph_objects as go
+    from matplotlib.figure import Figure
 
 _T_co = TypeVar("_T_co", covariant=True)
 
