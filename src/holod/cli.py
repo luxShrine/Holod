@@ -231,6 +231,12 @@ def train(
     default=False,
     help="Only report architecture and inference statistics; skip training.",
 )
+@click.option(
+    "--display",
+    default="save",
+    type=click.Choice(["save", "show", "both"]),
+    help="Save the backbone-comparison plot, show it, or both.",
+)
 def compare(
     models: tuple[str, ...],
     num_classes: int | None,
@@ -241,6 +247,7 @@ def compare(
     device_user: str | None,
     use_sample_data: bool | None,
     skip_train: bool,
+    display: str,
 ) -> None:
     """Compare each model backbone under one shared configuration."""
     from serde.toml import from_toml
@@ -248,7 +255,7 @@ def compare(
     from holod.core.compare import compare_backbones
     from holod.infra.dataclasses import AutoConfig, Flags, Paths, Train, UserConfig
     from holod.infra.log import console_ as console
-    from holod.infra.util.types import AnalysisType, ModelType, UserDevice
+    from holod.infra.util.types import AnalysisType, DisplayType, ModelType, UserDevice
 
     selected = [ModelType(m) for m in models] if models else None
 
@@ -304,6 +311,7 @@ def compare(
     report = compare_backbones(autofocus_config, backbones=selected, run_training=not skip_train)
     console.print(report.to_table())
     report.save()
+    report.plot(DisplayType(display))
 
 
 @cli.command()
@@ -325,13 +333,22 @@ def compare(
 @click.option(
     "--wavelength", default=530e-9, help="Wavelength of light used to capture the image (m)"
 )
-@click.option("--dx", default=1e-6, help="Size of image px (m)")
+# default matches SENSOR_PIXEL_PITCH_M (kept literal here: heavy types import stays lazy)
+@click.option("--dx", default=3.8e-6, help="Pixel pitch of the capture sensor (m)")
 @click.option(
     "--z-true",
     "z_true_mm",
     default=None,
     type=float,
     help="Ground-truth depth (mm); enables ranking models by absolute error.",
+)
+@click.option(
+    "--l-value",
+    "l_mm",
+    default=None,
+    type=float,
+    help="DLHM source-to-screen distance L (mm, the dataset's L_value); lets focus "
+    "scoring reconstruct at the correct effective depth.",
 )
 @click.option(
     "--device",
@@ -353,6 +370,7 @@ def compare_holo(
     wavelength: float,
     dx: float,
     z_true_mm: float | None,
+    l_mm: float | None,
     device: str | None,
     display: str,
 ) -> None:
@@ -378,6 +396,7 @@ def compare_holo(
         wavelength=wavelength,
         dx=dx,
         z_true_mm=z_true_mm,
+        l_mm=l_mm,
         device=device,
     )
     console.print(report.to_table())
@@ -437,7 +456,8 @@ def plot_train(
 @click.option(
     "--wavelength", default=530e-9, help="Wavelength of light used to capture the image (m)"
 )
-@click.option("--dx", default=1e-6, help="Size of image px (m)")
+# default matches SENSOR_PIXEL_PITCH_M (kept literal here: heavy types import stays lazy)
+@click.option("--dx", default=3.8e-6, help="Pixel pitch of the capture sensor (m)")
 @click.option(
     "--display",
     default="save",

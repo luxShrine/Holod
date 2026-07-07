@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -10,12 +10,25 @@ from torchvision.transforms import v2
 from holod.infra.dataclasses import AutoConfig
 from holod.infra.log import get_logger
 from holod.infra.util.image_processing import crop_max_square
-from holod.infra.util.types import AnalysisType, Arr32, ModelType, ReconstructionMethod
+from holod.infra.util.types import (
+    SENSOR_PIXEL_PITCH_M,
+    AnalysisType,
+    Arr32,
+    ModelType,
+    ReconstructionMethod,
+)
 
 if TYPE_CHECKING:
     from PIL.Image import Image as ImageType
 
-__all__ = ["recon_inline", "torch_recon"]
+__all__ = [
+    "dlhm_effective_z_mm",
+    "focus_score",
+    "gradient_tamura",
+    "recon_inline",
+    "tamura_coefficient",
+    "torch_recon",
+]
 logger = get_logger(__name__)
 i = 1j  # just for my sanity
 
@@ -25,7 +38,7 @@ def torch_recon(
     wavelength: float,
     ckpt_file: str,
     crop_size: int = 512,
-    dx: float = 3.8e-6,
+    dx: float = SENSOR_PIXEL_PITCH_M,
 ):
     """Reconstruct amplitude/phase from a hologram image using a depth predicted by a model."""
     pil_image: ImageType = Image.open(img_file_path).convert("RGB")
@@ -110,13 +123,12 @@ def torch_recon(
 
     # torch expects float32
     intensity_image = np.asarray(crop_max_square(pil_image).convert("L"), np.float32) / 255.0
-    amp, phase, nrmse, psnr = recon_inline(
-        intensity_image, wavelength=wavelength, z=z_expect * 1e-3, px=dx
-    )
+    amp, phase = recon_inline(intensity_image, wavelength=wavelength, z=z_expect * 1e-3, px=dx)
+    focus_tc = focus_score(intensity_image, wavelength, z_expect * 1e-3, dx)
 
     hologram = np.array(pil_image_crop)
     # TODO: collect these returns into a dataclass for easier access/processing
-    return hologram, amp, phase, nrmse, psnr
+    return hologram, amp, phase, focus_tc
 
 
 def recon_inline(
@@ -128,7 +140,7 @@ def recon_inline(
     reference: npt.NDArray[np.complex64] | float | None = None,
     method: ReconstructionMethod = ReconstructionMethod.FRESNEL,
     pad: bool = True,
-) -> tuple[Arr32, Arr32, float, float]:
+) -> tuple[Arr32, Arr32]:
     """Reconstruct amplitude and phase by scalar diffraction propagation.
 
     Returns:
@@ -215,49 +227,62 @@ def recon_inline(
     amplitude = np.abs(U1).astype(np.float32)
     phase = np.angle(U1).astype(np.float32)
 
-    (nmrse, psnr) = forward_holo_error(amplitude, phase, I, wavelength, z, px)
-    return amplitude, phase, nmrse, psnr
+    return amplitude, phase
 
 
-# TODO: repeated process from above in angular, remove that functionalility, just call this function
-def propagate_angular(U: np.ndarray, wavelength: float, z: float, px: float) -> np.ndarray:
-    """Propagate reconstructed complex field back to the sensor plane and synthesize a hologram."""
-    H, W = U.shape
-    k = 2 * np.pi / wavelength
-    fx = np.fft.fftfreq(W, d=px)
-    fy = np.fft.fftfreq(H, d=px)
-    FX, FY = np.meshgrid(fx, fy, indexing="xy")
-    kx, ky = 2 * np.pi * FX, 2 * np.pi * FY
-    kz = np.sqrt(np.maximum(0, k**2 - (kx**2 + ky**2))) + (
-        i * np.sqrt(np.maximum(0, (kx**2 + ky**2) - k**2))
-    )
-    Hf = np.exp(i * z * kz)
-    return np.fft.ifft2(np.fft.fft2(U) * Hf)
+def tamura_coefficient(image: npt.NDArray[np.floating[Any]]) -> float:
+    """Tamura coefficient ``TC = sqrt(std / mean)`` of a non-negative image.
+
+    A contrast statistic widely used as a holographic autofocus criterion
+    (Memmolo et al., Opt. Lett. 36, 2011).
+    """
+    arr = np.asarray(image, dtype=np.float64)
+    mean = float(arr.mean())
+    if mean <= 0.0:
+        return 0.0
+    return float(np.sqrt(arr.std() / mean))
 
 
-def forward_holo_error(
-    amp: np.ndarray,
-    phase: np.ndarray,
-    I_meas: np.ndarray,
-    wavelength: float,
-    z: float,
-    px: float,
-    reference_amp: float = 1.0,
-) -> tuple[float, float]:
-    """Compare reconstructed hologram with actual intensity."""
-    # reconstruct complex field at object plane
-    U = amp * np.exp(i * phase)
-    # propagate back to sensor plane
-    U0 = propagate_angular(U, wavelength, -z, px)
-    # synthesize hologram (inline, unit reference amplitude)
-    I_hat = np.abs(U0 + reference_amp) ** 2
-    I_hat = (I_hat / I_hat.max()).astype(np.float32)
-    I_meas = (I_meas / I_meas.max()).astype(np.float32)
+def gradient_tamura(amplitude: npt.NDArray[np.floating[Any]]) -> float:
+    """Tamura coefficient of the gradient magnitude of a reconstructed amplitude.
 
-    # NRMSE & PSNR
-    err = I_hat - I_meas
-    # MSE = 1/n \sum_{i=1}^{n} ( x_i - \hat{x}_{i} )^{2}
-    mse = np.mean(err**2)
-    nrmse = cast("float", np.linalg.norm(err) / np.linalg.norm(I_meas))
-    psnr = 10.0 * np.log10(1.0 / (mse + 1e-12))
-    return nrmse, psnr
+    Edge energy concentrates at the in-focus plane, so this score is *maximized*
+    at the correct reconstruction depth   higher is sharper. Empirically it peaks
+    at the true focus on this project's DLHM holograms where the plain amplitude
+    Tamura coefficient stays flat.
+    """
+    gy, gx = np.gradient(np.asarray(amplitude, dtype=np.float64))
+    return tamura_coefficient(np.sqrt(gx**2 + gy**2))
+
+
+def focus_score(intensity: Arr32, wavelength: float, z: float, px: float) -> float:
+    """Label-free focus sharpness of a hologram reconstructed at depth ``z`` (m).
+
+    Suppresses the DC reference term (uses the hologram contrast ``I/mean(I) - 1``,
+    without which the propagated field is dominated by the background and carries no
+    focus signal), backpropagates it, and returns the gradient-Tamura sharpness of
+    the resulting amplitude. Higher is sharper.
+    """
+    meas = np.asarray(intensity, dtype=np.float32)
+    contrast = (meas / max(float(meas.mean()), 1e-12) - 1.0).astype(np.complex64)
+    (amplitude, _phase) = recon_inline(meas, wavelength=wavelength, z=z, px=px, field0=contrast)
+    return gradient_tamura(amplitude)
+
+
+def dlhm_effective_z_mm(z_source_sample_mm: float, l_source_screen_mm: float) -> float:
+    """Plane-wave-equivalent reconstruction distance for a DLHM hologram (mm).
+
+    In DLHM the sample sits ``z`` from the point source and the sensor at ``L``; by
+    the Fresnel scaling theorem the recorded hologram, backpropagated on the sensor
+    grid with a plane wave, refocuses at ``M * (L - z)`` with ``M = L / z``. Returns
+    ``z`` unchanged (no correction) when the geometry is degenerate (``z <= 0`` or
+    ``z >= L``), as can happen with unconstrained regression predictions.
+    """
+    if not 0.0 < z_source_sample_mm < l_source_screen_mm:
+        logger.warning(
+            f"DLHM geometry degenerate (z={z_source_sample_mm} mm, L={l_source_screen_mm} mm); "
+            + "using the uncorrected depth for reconstruction."
+        )
+        return z_source_sample_mm
+    magnification = l_source_screen_mm / z_source_sample_mm
+    return magnification * (l_source_screen_mm - z_source_sample_mm)

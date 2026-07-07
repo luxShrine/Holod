@@ -18,7 +18,7 @@ from serde import serde
 from serde.json import to_json
 from torchvision.transforms import v2
 
-from holod.core.optics.reconstruction import recon_inline
+from holod.core.optics.reconstruction import dlhm_effective_z_mm, focus_score
 from holod.infra.dataclasses import AutoConfig
 from holod.infra.dataset import HologramFocusDataset
 from holod.infra.log import console_ as console
@@ -26,7 +26,12 @@ from holod.infra.log import get_logger
 from holod.infra.training import Checkpoint, ModelCheckpoint, train_eval_epoch, transform_ds
 from holod.infra.util.image_processing import crop_max_square
 from holod.infra.util.paths import checkpoints_loc, report_path
-from holod.infra.util.types import AnalysisType, DisplayType, ModelType
+from holod.infra.util.types import (
+    SENSOR_PIXEL_PITCH_M,
+    AnalysisType,
+    DisplayType,
+    ModelType,
+)
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -74,6 +79,9 @@ class BackboneStats:
     avg_train_loss: float | None = None
     avg_val_loss: float | None = None
     best_val_metric: float | None = None
+    # final-epoch validation MAE between predicted and true bin centers (mm);
+    # classification only   for regression best_val_metric is already the MAE
+    val_mae_mm: float | None = None
     error: str | None = None
 
 
@@ -109,7 +117,7 @@ class ComparisonReport:
 
     def to_table(self) -> Table:
         """Render the report as a Rich table, highlighting the best trained backbone."""
-        metric_header = "Accuracy" if self.analysis == AnalysisType.CLASS.value else "Val MAE (m)"
+        metric_header = "Accuracy" if self.analysis == AnalysisType.CLASS.value else "Val MAE (mm)"
         table = Table(
             title=f"Backbone comparison ({self.analysis}, {self.device}, crop {self.crop_size})"
         )
@@ -127,6 +135,9 @@ class ComparisonReport:
             table.add_column("Train loss", justify="right")
             table.add_column("Val loss", justify="right")
             table.add_column(metric_header, justify="right")
+            if self.analysis == AnalysisType.CLASS.value:
+                # accuracy misses how far off wrong bins are; MAE in mm shows that
+                table.add_column("Val MAE (mm)", justify="right")
         table.add_column("Error")
 
         best = self.best_index()
@@ -151,6 +162,8 @@ class ComparisonReport:
                         _fmt(s.best_val_metric, ".4g"),
                     ]
                 )
+                if self.analysis == AnalysisType.CLASS.value:
+                    row.append(_fmt(s.val_mae_mm, ".4g"))
             row.append(s.error if s.error is not None else "")
             table.add_row(*row, style="bold green" if i == best else None)
         return table
@@ -165,6 +178,100 @@ class ComparisonReport:
         pl.DataFrame([asdict(s) for s in self.stats]).write_csv(csv_path)
         logger.info(f"Comparison report saved to {json_path} and {csv_path}")
         return (json_path, csv_path)
+
+    def plot(self, display: DisplayType = DisplayType.SAVE) -> Path | None:
+        """Plot per-backbone training statistics (or static stats) as bar charts."""
+        # heavy dep, imported lazily like the CLI does
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        plotted = [(i, s) for (i, s) in enumerate(self.stats) if s.error is None]
+        if not plotted:
+            logger.warning("No successful backbone runs to plot.")
+            return None
+        best = self.best_index()
+        names = [s.backbone for (_i, s) in plotted]
+        colors = [PLOT_ACCENT if i == best else PLOT_MUTED for (i, _e) in plotted]
+
+        # one panel per statistic: (subplot title, per-backbone values, format spec)
+        panels: list[tuple[str, list[float | None], str]]
+        if self.trained:
+            metric_title = (
+                "Accuracy (higher is better)"
+                if self.analysis == AnalysisType.CLASS.value
+                else "Val MAE (mm, lower is better)"
+            )
+            panels = [
+                (metric_title, [s.best_val_metric for (_i, s) in plotted], ".4g"),
+                (
+                    "Validation loss (lower is better)",
+                    [s.avg_val_loss for (_i, s) in plotted],
+                    ".4g",
+                ),
+                ("Time per epoch (s)", [s.time_per_epoch_s for (_i, s) in plotted], ".1f"),
+            ]
+            if any(s.val_mae_mm is not None for (_i, s) in plotted):
+                panels.insert(
+                    1,
+                    (
+                        "Val MAE (mm, lower is better)",
+                        [s.val_mae_mm for (_i, s) in plotted],
+                        ".4g",
+                    ),
+                )
+        else:
+            panels = [
+                ("Parameters (M)", [s.total_params / 1e6 for (_i, s) in plotted], ".2f"),
+                ("Latency (ms/img)", [s.latency_ms_per_img for (_i, s) in plotted], ".2f"),
+                ("Model size (MB)", [s.model_size_mb for (_i, s) in plotted], ".1f"),
+            ]
+
+        fig = make_subplots(
+            rows=1,
+            cols=len(panels),
+            shared_yaxes=True,
+            horizontal_spacing=0.06,
+            subplot_titles=[title for (title, _values, _spec) in panels],
+        )
+        for col, (title, values, spec) in enumerate(panels, start=1):
+            _ = fig.add_trace(
+                go.Bar(
+                    y=names,
+                    x=values,
+                    orientation="h",
+                    marker_color=colors,
+                    text=[_fmt(v, spec) for v in values],
+                    textposition="outside",
+                    textfont={"color": PLOT_INK_SOFT},
+                    cliponaxis=False,
+                    showlegend=False,
+                    name=title,
+                ),
+                row=1,
+                col=col,
+            )
+        stats_kind = "training statistics" if self.trained else "architecture statistics"
+        _ = fig.update_layout(
+            title_text=f"Backbone {stats_kind}   {self.analysis}, {self.device}, "
+            + f"crop {self.crop_size}",
+            paper_bgcolor=PLOT_SURFACE,
+            plot_bgcolor=PLOT_SURFACE,
+            font={"family": "system-ui, sans-serif", "color": PLOT_INK_SOFT},
+            bargap=0.35,
+            margin={"t": 80},
+        )
+        _ = fig.update_xaxes(gridcolor=PLOT_GRID, zeroline=False)
+        _ = fig.update_yaxes(gridcolor=PLOT_GRID, autorange="reversed")
+
+        html_path: Path | None = None
+        if display is not DisplayType.SHOW:
+            stamp = datetime.now().strftime("%H%M%S")
+            html_path = report_path(figure=True) / f"backbone_comparison_{stamp}.html"
+            fig.write_html(html_path, full_html=True, include_plotlyjs="cdn")
+            logger.info(f"Backbone comparison plot saved to {html_path}")
+        if display in (DisplayType.SHOW, DisplayType.BOTH):
+            fig.show()
+        return html_path
 
 
 def _fmt(value: float | None, spec: str) -> str:
@@ -247,7 +354,7 @@ def collect_model_stats(a_cfg: AutoConfig) -> BackboneStats:
 
 def _metric_name(analysis: AnalysisType) -> str:
     """Name of the validation metric reported for an analysis type."""
-    return "accuracy" if analysis == AnalysisType.CLASS else "mae_m"
+    return "accuracy" if analysis == AnalysisType.CLASS else "mae_mm"
 
 
 def _fill_training_stats(
@@ -265,6 +372,7 @@ def _fill_training_stats(
     entry.avg_train_loss = output.avg_train_loss
     entry.avg_val_loss = output.avg_val_loss
     entry.best_val_metric = output.best_val_metric
+    entry.val_mae_mm = output.val_mae_mm
 
 
 def compare_backbones(
@@ -278,7 +386,7 @@ def compare_backbones(
         a_cfg: Shared runtime configuration; its ``backbone`` field is replaced per run.
         backbones: Which backbones to compare; ``None`` compares every ``ModelType``.
         run_training: When ``False``, only architecture and inference statistics are
-            collected — no dataset is loaded and no training happens.
+            collected   no dataset is loaded and no training happens.
 
     Returns:
         A ``ComparisonReport`` with one ``BackboneStats`` entry per requested backbone.
@@ -341,9 +449,17 @@ class HologramEval:
     runs: int = 0
     z_pred_mm: float | None = None
     latency_ms_per_run: float | None = None
-    nrmse: float | None = None
-    psnr_db: float | None = None
+    # gradient-Tamura sharpness of the reconstruction at z_pred; higher is sharper
+    # (see focus_score in core/optics/reconstruction.py)
+    focus_tc: float | None = None
     abs_error_mm: float | None = None
+    # signed prediction error (positive = overshoot); exposes systematic bias
+    signed_error_mm: float | None = None
+    # absolute error as a percentage of the true depth
+    rel_error_pct: float | None = None
+    # absolute error in units of the classifier's bin width, i.e. how many bins
+    # off the expected-depth prediction is (classification only)
+    err_in_bins: float | None = None
     error: str | None = None
 
 
@@ -359,13 +475,17 @@ class HologramComparisonReport:
     dx_m: float
     z_true_mm: float | None
     created: str
+    # DLHM source->screen distance L (mm); when known, focus scoring reconstructs
+    # at the plane-wave-equivalent depth M*(L - z) instead of z directly
+    l_mm: float | None = None
     evals: list[HologramEval] = field(default_factory=list)
 
     def best_index(self) -> int | None:
         """Return the index of the best evaluation.
 
-        Ranked by absolute depth error when a ground-truth depth is known, otherwise by
-        the label-free forward-reconstruction NRMSE (lower is better for both).
+        Ranked by absolute depth error when a ground-truth depth is known (lower is
+        better), otherwise by the label-free gradient-Tamura focus score (higher is
+        sharper).
         """
         if self.z_true_mm is not None:
             scored = [
@@ -373,11 +493,13 @@ class HologramComparisonReport:
                 for (i, e) in enumerate(self.evals)
                 if e.abs_error_mm is not None
             ]
-        else:
-            scored = [(i, e.nrmse) for (i, e) in enumerate(self.evals) if e.nrmse is not None]
+            if not scored:
+                return None
+            return min(scored, key=lambda pair: pair[1])[0]
+        scored = [(i, e.focus_tc) for (i, e) in enumerate(self.evals) if e.focus_tc is not None]
         if not scored:
             return None
-        return min(scored, key=lambda pair: pair[1])[0]
+        return max(scored, key=lambda pair: pair[1])[0]
 
     def to_table(self) -> Table:
         """Render the report as a Rich table, highlighting the best evaluation."""
@@ -391,9 +513,11 @@ class HologramComparisonReport:
         table.add_column("z pred (mm)", justify="right")
         if self.z_true_mm is not None:
             table.add_column("|err| (mm)", justify="right")
+            table.add_column("err (mm)", justify="right")
+            table.add_column("err %", justify="right")
+            table.add_column("err (bins)", justify="right")
         table.add_column("ms/run", justify="right")
-        table.add_column("NRMSE", justify="right")
-        table.add_column("PSNR (dB)", justify="right")
+        table.add_column("Focus TC", justify="right")
         table.add_column("Error")
 
         best = self.best_index()
@@ -405,12 +529,18 @@ class HologramComparisonReport:
                 _fmt(e.z_pred_mm, ".4g"),
             ]
             if self.z_true_mm is not None:
-                row.append(_fmt(e.abs_error_mm, ".4g"))
+                row.extend(
+                    [
+                        _fmt(e.abs_error_mm, ".4g"),
+                        _fmt(e.signed_error_mm, "+.4g"),
+                        _fmt(e.rel_error_pct, ".1f"),
+                        _fmt(e.err_in_bins, ".2f"),
+                    ]
+                )
             row.extend(
                 [
                     _fmt(e.latency_ms_per_run, ".2f"),
-                    _fmt(e.nrmse, ".4g"),
-                    _fmt(e.psnr_db, ".2f"),
+                    _fmt(e.focus_tc, ".4g"),
                     e.error if e.error is not None else "",
                 ]
             )
@@ -447,7 +577,10 @@ class HologramComparisonReport:
             cols=2,
             shared_yaxes=True,
             horizontal_spacing=0.06,
-            subplot_titles=("Predicted depth (mm)", "Reconstruction NRMSE (lower is better)"),
+            subplot_titles=[
+                "Predicted depth (mm)",
+                "Focus sharpness (gradient Tamura, higher is better)",
+            ],
         )
         _ = fig.add_trace(
             go.Bar(
@@ -468,15 +601,15 @@ class HologramComparisonReport:
         _ = fig.add_trace(
             go.Bar(
                 y=names,
-                x=[e.nrmse for (_i, e) in plotted],
+                x=[e.focus_tc for (_i, e) in plotted],
                 orientation="h",
                 marker_color=colors,
-                text=[_fmt(e.nrmse, ".4g") for (_i, e) in plotted],
+                text=[_fmt(e.focus_tc, ".4g") for (_i, e) in plotted],
                 textposition="outside",
                 textfont={"color": PLOT_INK_SOFT},
                 cliponaxis=False,
                 showlegend=False,
-                name="NRMSE",
+                name="Tamura TC",
             ),
             row=1,
             col=2,
@@ -493,7 +626,7 @@ class HologramComparisonReport:
                 col=1,
             )
         _ = fig.update_layout(
-            title_text=f"Depth prediction per model — {Path(self.image).name} ({self.device})",
+            title_text=f"Depth prediction per model   {Path(self.image).name} ({self.device})",
             paper_bgcolor=PLOT_SURFACE,
             plot_bgcolor=PLOT_SURFACE,
             font={"family": "system-ui, sans-serif", "color": PLOT_INK_SOFT},
@@ -570,14 +703,19 @@ def _predict_depth_mm(
     analysis: AnalysisType,
     ckpt: Checkpoint,
 ) -> float:
-    """Run one forward pass and map the output to a depth in millimeters."""
+    """Run one forward pass and map the output to a depth in millimeters.
+
+    Classification models are decoded to the probability-weighted mean of the bin
+    centers rather than the argmax center: weakly separated checkpoints often share
+    an argmax bin (collapsing them to identical predictions), while the expectation
+    varies continuously with the logits and so discriminates between checkpoints.
+    """
     with torch.no_grad():
         pred = model(input_tensor)  # shape [Batch, Classes]
     if analysis == AnalysisType.CLASS:
-        probs = torch.softmax(pred, dim=1)
-        index = int(probs.argmax(1).item())
+        probs = torch.softmax(pred, dim=1).squeeze(0).double().cpu().numpy()
         centers = np.asarray(ckpt.bin_centers, dtype=np.float64)
-        return float(centers[index])
+        return float(np.dot(probs, centers))
     if ckpt.z_avg is not None and ckpt.z_std is not None:
         # reverse the label normalization applied by RegLabelTransform during training
         return float(pred.squeeze()) * ckpt.z_std + ckpt.z_avg
@@ -593,11 +731,15 @@ def evaluate_checkpoint_on_hologram(
     wavelength: float,
     dx: float,
     z_true_mm: float | None,
+    l_mm: float | None = None,
 ) -> HologramEval:
     """Evaluate one checkpoint on a hologram, timing ``runs`` repeated predictions.
 
-    The predicted depth is scored by propagating the hologram to that depth with
-    ``recon_inline`` and comparing the synthesized hologram against the measured one.
+    The predicted depth is scored label-free with ``focus_score`` (gradient-Tamura
+    sharpness of the reconstruction; higher is sharper). When the DLHM source->screen
+    distance ``l_mm`` is known, the reconstruction is done at the plane-wave-equivalent
+    depth ``dlhm_effective_z_mm(z_pred, l_mm)``   without it the raw predicted depth is
+    used, which does not refocus DLHM holograms and makes the score uninformative.
     """
     entry = HologramEval(model_name=ckpt_path.name, runs=runs)
     (model, cfg, ckpt) = _load_checkpoint_model(ckpt_path, device)
@@ -619,11 +761,20 @@ def evaluate_checkpoint_on_hologram(
     entry.z_pred_mm = z_pred_mm
 
     intensity = np.asarray(pil_image.convert("L"), np.float32) / 255.0
-    (_amp, _phase, entry.nrmse, entry.psnr_db) = recon_inline(
-        intensity, wavelength=wavelength, z=z_pred_mm * 1e-3, px=dx
-    )
+    z_recon_mm = dlhm_effective_z_mm(z_pred_mm, l_mm) if l_mm is not None else z_pred_mm
+    entry.focus_tc = focus_score(intensity, wavelength, z_recon_mm * 1e-3, dx)
     if z_true_mm is not None:
         entry.abs_error_mm = abs(z_pred_mm - z_true_mm)
+        entry.signed_error_mm = z_pred_mm - z_true_mm
+        if z_true_mm != 0:
+            entry.rel_error_pct = entry.abs_error_mm / abs(z_true_mm) * 100
+        if cfg.analysis == AnalysisType.CLASS and ckpt.bin_centers is not None:
+            centers = np.asarray(ckpt.bin_centers, dtype=np.float64)
+            if len(centers) >= 2:
+                # bins come from a uniform linspace, so one gap is the bin width
+                bin_width_mm = float(centers[1] - centers[0])
+                if bin_width_mm > 0:
+                    entry.err_in_bins = entry.abs_error_mm / bin_width_mm
     return entry
 
 
@@ -633,8 +784,9 @@ def compare_on_hologram(
     runs: int = 5,
     crop_size: int = 224,
     wavelength: float = 530e-9,
-    dx: float = 1e-6,
+    dx: float = SENSOR_PIXEL_PITCH_M,
     z_true_mm: float | None = None,
+    l_mm: float | None = None,
     device: str | None = None,
 ) -> HologramComparisonReport:
     """Run comparison test evaluations of multiple trained models on one hologram.
@@ -645,9 +797,14 @@ def compare_on_hologram(
             under ``checkpoints_loc()``.
         runs: How many repeated predictions to time per model.
         crop_size: Center-crop applied before inference (ViT is forced to 224).
-        wavelength: Wavelength of the capture illumination (m), for reconstruction scoring.
-        dx: Pixel pitch of the sensor (m), for reconstruction scoring.
+        wavelength: Wavelength of the capture illumination (m), for focus scoring.
+        dx: Pixel pitch of the sensor (m), for focus scoring; defaults to the
+            3.8 µm pitch of the project's capture sensor.
         z_true_mm: Optional ground-truth depth (mm); enables absolute-error ranking.
+        l_mm: Optional DLHM source->screen distance L (mm, the dataset's ``L_value``).
+            When given, focus scoring reconstructs at the plane-wave-equivalent depth
+            ``M * (L - z)``   strongly recommended, as raw depths do not refocus
+            DLHM holograms.
         device: ``"cuda"``/``"cpu"``; ``None`` picks CUDA when available.
 
     Returns:
@@ -671,7 +828,7 @@ def compare_on_hologram(
         console.rule(f"[black on cyan] Evaluating model: {ckpt_path.name} ")
         try:
             entry = evaluate_checkpoint_on_hologram(
-                ckpt_path, pil_image, dev, runs, crop_size, wavelength, dx, z_true_mm
+                ckpt_path, pil_image, dev, runs, crop_size, wavelength, dx, z_true_mm, l_mm
             )
         except Exception as exc:
             entry = HologramEval(model_name=ckpt_path.name, runs=runs)
@@ -687,5 +844,6 @@ def compare_on_hologram(
         dx_m=dx,
         z_true_mm=z_true_mm,
         created=datetime.now().isoformat(timespec="seconds"),
+        l_mm=l_mm,
         evals=evals,
     )

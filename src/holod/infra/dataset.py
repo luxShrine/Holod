@@ -14,6 +14,7 @@ import holod.infra.util.paths as paths
 from holod.infra.log import get_logger
 from holod.infra.util.image_processing import correct_data_csv, parse_info
 from holod.infra.util.types import (
+    SENSOR_PIXEL_PITCH_M,
     AnalysisType,
     Arr32,
     Arr64,
@@ -104,15 +105,16 @@ class HologramFocusDataset(Dataset[tuple[ImageType, np.float64 | int]]):
         self.paths: list[Path] = [holo_dir / Path(p) for p in self.records["path"].to_list()]
 
         self.z: HologramDepths = HologramDepths(self.records["z_value"].to_numpy())
+        # CSV Wavelength column is in micrometers (e.g. 0.405 for a 405 nm laser)
         self.wavelength: Arr64 = self.records["Wavelength"].to_numpy()
-        # NOTE: constant pixel size
-        self.pixel_size: Arr32 = np.full(len(self.z), 3.8e-6, dtype=np.float32)
+        # NOTE: constant pixel size (meters)
+        self.pixel_size: Arr32 = np.full(len(self.z), SENSOR_PIXEL_PITCH_M, dtype=np.float32)
 
         # the z depth on its own cannot be passed to the model, it must be
         # converted to a set of bins, as integers. to do so digitize array => bins
         z_uniq: Arr64 = np.unique(self.z.z_array)
         logger.debug(
-            f"unique depths sample (m): {z_uniq[:10]} \n total: {len(np.unique(self.z.z_array))}"
+            f"unique depths sample (mm): {z_uniq[:10]} \n total: {len(np.unique(self.z.z_array))}"
         )
 
         if self.mode == AnalysisType.CLASS:

@@ -24,6 +24,10 @@ Q_ = ureg.Quantity  # short alias
 
 u = ureg  # short namespace, for u.um, u.nm, u.m
 
+# -- PHYSICAL CONSTANTS --------------------------------------------------------------------------
+# pixel pitch of the sensor the datasets were captured with (meters)
+SENSOR_PIXEL_PITCH_M: float = 3.8e-6
+
 
 # -- NUMPY HELPERS -------------------------------------------------------------------------------
 type Np1Array64 = npt.NDArray[np.float64]

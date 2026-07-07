@@ -100,7 +100,7 @@ def _check_model_improvement(
         # Lower MAE is better
         save_best_model_flag = epoch_metric.metric_val < best_val
         best_val_out = epoch_metric.metric_val if save_best_model_flag else best_val
-        logger.debug(f"At {epoch} / {a_cfg.epoch_count} Val MAE: {epoch_metric.metric_val:.9f} µm")
+        logger.debug(f"At {epoch} / {a_cfg.epoch_count} Val MAE: {epoch_metric.metric_val:.9f} mm")
     else:
         # Higher Accuracy is better
         save_best_model_flag = epoch_metric.metric_val > best_val
@@ -131,16 +131,19 @@ def _check_model_improvement(
                 )
                 return None
 
-    # convert best_val_metric form of 5 numbers, in scientific notation
-    # create file with name that is unique to evaluation
-    best_model_name: str = path_to_model.name.removesuffix(".pth") + f"{best_val_out:3e}" + ".pth"
-    path_to_model_detail = path_to_model.parent / Path(best_model_name)
+    if save_best_model_flag:
+        # convert best_val_metric form of 5 numbers, in scientific notation
+        # create file with name that is unique to evaluation
+        best_model_name: str = (
+            path_to_model.name.removesuffix(".pth") + f"{best_val_out:3e}" + ".pth"
+        )
+        path_to_model_detail = path_to_model.parent / Path(best_model_name)
 
-    # check if files in directory has potential amount of
-    # files to reach limit before loop.
-    remove_oldest_checkpoint(path_to_model_detail)
-    checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, a_cfg, best_val_out)
-    checkpoint.torch_save(path_to_model_detail)
+        # check if files in directory has potential amount of
+        # files to reach limit before loop.
+        remove_oldest_checkpoint(path_to_model_detail)
+        checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, a_cfg, best_val_out)
+        checkpoint.torch_save(path_to_model_detail)
     return TrainProgress(best_val_out, save_best_model_flag)
 
 
@@ -193,6 +196,13 @@ def epoch_loop(
     epoch_metric: EpochMetric = EpochMetric()
     abs_err_sum: int | float = 0
     total_samples_for_metric: int = 0  # Denominator for MAE/Accuracy
+    # bin-center lookup for the physical-distance MAE (classification only)
+    bin_centers_tens: Tensor | None = None
+    phys_err_sum: float = 0.0
+    if a_cfg.analysis == AnalysisType.CLASS and core_trainer.bin_centers is not None:
+        bin_centers_tens = torch.as_tensor(
+            core_trainer.bin_centers, dtype=torch.float32, device=device
+        )
     imgs: Tensor
     labels: Tensor
     for imgs, labels in loader:
@@ -285,12 +295,24 @@ def epoch_loop(
             # number of correct predictions
             total_samples_for_metric += labels_tens.size(0)
 
+            if bin_centers_tens is not None:
+                # physical distance between predicted and true depth bins; unlike accuracy
+                # this distinguishes a 1-bin miss from a many-bin miss (mm, quantized to
+                # bin centers so within-bin error is excluded)
+                phys_err_sum += (
+                    torch.sum(
+                        torch.abs(bin_centers_tens[pred_classes] - bin_centers_tens[labels_tens])
+                    )
+                ).item()
+
         # using bin value for classification or # continuous value for regression
         epoch_metric.labels_tensor = torch.as_tensor(
             core_trainer.evaluation_metric,
             dtype=torch.float32,
         )
         epoch_metric.metric_val = abs_err_sum / total_samples_for_metric
+        if bin_centers_tens is not None:
+            epoch_metric.mae_mm = phys_err_sum / total_samples_for_metric
 
         # update progress bar
         if step == "val":
@@ -535,6 +557,7 @@ def train_eval_epoch(
             )
             if train_status is None:
                 break
+            best_val_metric = train_status.best_val
 
             # Always save latest model, after going through both loaders
             model_checkpoint = ModelCheckpoint.from_epoch(
@@ -558,7 +581,14 @@ def train_eval_epoch(
                 lr=core_trainer.optimizer.param_groups[0]["lr"],
             )
 
-    return TrainingOutput(avg_loss_train, avg_loss_val, epoch_metric.metric_val, best_val_metric)
+    return TrainingOutput(
+        avg_loss_train,
+        avg_loss_val,
+        epoch_metric.metric_val,
+        best_val_metric,
+        # epoch_metric here is from the final validation pass
+        val_mae_mm=epoch_metric.mae_mm,
+    )
 
 
 def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotPred:

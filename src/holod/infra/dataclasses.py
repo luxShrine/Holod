@@ -504,6 +504,9 @@ class EpochMetric:
     metric_val: float = 0
     total_samples: int = 0
     labels_tensor: Tensor = torch.empty([1, 1])
+    # MAE between predicted and true bin centers, in the dataset's z units (mm);
+    # classification only   for regression metric_val is already the physical MAE
+    mae_mm: float | None = None
 
     def average_loss(self) -> float:
         """Compute the average loss of an epoch."""
@@ -523,6 +526,8 @@ class TrainingOutput:
     avg_val_loss: float
     evaluation_metric: float
     best_val_metric: float
+    # final-epoch validation MAE in bin-center distance (mm); classification only
+    val_mae_mm: float | None = None
 
     def display_loss(self) -> None:
         """Display the relevant metrics generated after training."""

@@ -733,15 +733,12 @@ def plot_amp_phase(
     from holod.core.metrics import wrap_phase
     from holod.core.optics.reconstruction import torch_recon
 
-    hologram, amp_recon, phase_recon, nrmse, psnr = torch_recon(
+    hologram, amp_recon, phase_recon, focus_tc = torch_recon(
         img_file_path, wavelength, ckpt_file, crop_size, dx
     )
 
-    # hologram self‑consistency metric
-    # TODO:  make the coloring change depending on what range it falls in
-    # nrmse > 0.3 bad, 0.1-0.3 fair, 0.05 good
-    # PSNR < 20 bad, 20-30 fair, > 30 good
-    logger.info(f"PSNR: {psnr:.2f} dB, NRMSE: {nrmse:.4f}")
+    # label-free gradient-Tamura focus score; higher is sharper (see focus_score)
+    logger.info(f"Focus score of reconstruction (gradient Tamura): {focus_tc:.4f}")
 
     _save_path = Path(path_to_plot)
 
