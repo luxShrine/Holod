@@ -50,6 +50,56 @@ SAMPLE_PATH: Path = paths.data_root() / Path("MW_Dataset_Sample") / Path("ODP-DL
 type FieldsUnion = Paths | Train | Flags
 
 
+def check_csv_exists(create_csv: bool, ds_root: str, meta_csv_name: str):
+    use_sample_data = False
+    # parse user input and whether csv or data exists
+    create_csv_option: CreateCSVOption
+    if create_csv:
+        create_csv_option = CreateCSVOption.CSV_CREATE
+    elif (paths.data_root() / Path(ds_root) / Path(meta_csv_name)).exists():
+        create_csv_option = CreateCSVOption.CSV_VALID
+    elif (paths.data_root() / Path(ds_root)).exists():
+        create_csv_option = CreateCSVOption.CSV_MISSING
+    else:
+        create_csv_option = CreateCSVOption.CSV_DATA_MISSING
+
+    match create_csv_option:
+        case CreateCSVOption.CSV_DATA_MISSING:
+            # with csv missing see if user wants to use sample data, if not abort
+            logger.debug(f"Could not find dataset folder {ds_root}.")
+            use_sample_data = click.confirm(
+                f"Could not find dataset folder {ds_root}. Use sample data instead?",
+                default=True,
+                abort=True,
+            )
+        case CreateCSVOption.CSV_MISSING:
+            logger.debug(f"Could not find {meta_csv_name} in root of dataset folder {ds_root}.")
+            user_response: str = click.prompt(
+                f"Could not find '{meta_csv_name}' in root of dataset folder: '{ds_root}'. "
+                + "Attempt to create csv file from ds_root or use sample data?",
+                show_choices=True,
+                type=click.Choice(["sample", "create"], case_sensitive=False),
+            )
+            if user_response.lower() == "create":
+                # run it through again with create csv option
+                check_csv_exists(True, ds_root, meta_csv_name)
+            elif user_response.lower() == "sample":
+                use_sample_data = True
+            else:
+                raise RuntimeError("failed to parse user choice for creating CSV.")
+
+        case CreateCSVOption.CSV_VALID:
+            logger.info(f"Path to csv exists {meta_csv_name}, continuing...")
+
+        case CreateCSVOption.CSV_CREATE:
+            # parse the create input here as to allow for the user to select the desire to
+            # create a csv if the data is missing
+            csv_name: str = click.prompt("Enter a filename for csv", type=click.STRING)
+            HologramFocusDataset.create_meta(Path(ds_root), csv_name)
+
+    return use_sample_data
+
+
 # TODO: potentially compress some of these fields to utilize the flags, paths, and train classes
 @dataclass
 class AutoConfig:
@@ -241,49 +291,10 @@ class AutoConfig:
         else:
             raise Exception(f"Unknown backbone passed: {backbone}")
 
-        # parse user input and whether csv or data exists
-        create_csv_option: CreateCSVOption
-        if create_csv:
-            create_csv_option = CreateCSVOption.CSV_CREATE
-        elif (paths.data_root() / Path(ds_root) / Path(meta_csv_name)).exists():
-            create_csv_option = CreateCSVOption.CSV_VALID
-        elif (paths.data_root() / Path(ds_root)).exists():
-            create_csv_option = CreateCSVOption.CSV_MISSING
-        else:
-            create_csv_option = CreateCSVOption.CSV_DATA_MISSING
-
-        match create_csv_option:
-            case CreateCSVOption.CSV_DATA_MISSING:
-                # with csv missing see if user wants to use sample data, if not abort
-                logger.debug(f"Could not find dataset folder {ds_root}.")
-                use_sample_data = click.confirm(
-                    f"Could not find dataset folder {ds_root}. Use sample data instead?",
-                    default=True,
-                    abort=True,
-                )
-            case CreateCSVOption.CSV_MISSING:
-                logger.debug(f"Could not find {meta_csv_name} in root of dataset folder {ds_root}.")
-                user_response: str = click.prompt(
-                    f"Could not find '{meta_csv_name}' in root of dataset folder: '{ds_root}'. "
-                    + "Attempt to create csv file from ds_root or use sample data?",
-                    show_choices=True,
-                    type=click.Choice(["sample", "create"], case_sensitive=False),
-                )
-                if user_response.lower() == "create":
-                    create_csv_option = CreateCSVOption.CSV_CREATE
-                elif user_response.lower() == "sample":
-                    use_sample_data = True
-                else:
-                    raise RuntimeError("failed to parse user choice for creating CSV.")
-
-            case CreateCSVOption.CSV_VALID:
-                logger.info(f"Path to csv exists {meta_csv_name}, continuing...")
-
-        # parse the create input here as to allow for the user to select the desire to
-        # create a csv if the data is missing
-        if create_csv_option == CreateCSVOption.CSV_CREATE:
-            csv_name: str = click.prompt("Enter a filename for csv", type=click.STRING)
-            HologramFocusDataset.create_meta(Path(ds_root), csv_name)
+        create_csv = False if create_csv is None else create_csv
+        ds_root = "" if ds_root is None else ds_root
+        meta_csv_name = "" if meta_csv_name is None else meta_csv_name
+        use_sample_data = check_csv_exists(create_csv, ds_root, meta_csv_name)
 
         # WARN: not robust for all types, will need a change <05-09-25>
         if backbone_type == ModelType.VIT and crop_size != 224:
