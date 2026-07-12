@@ -100,6 +100,30 @@ def data_root() -> Path:
     return src_root() / "data"
 
 
+def resolve_dataset_root(ds_root: str | Path) -> Path:
+    """Resolve a dataset root that may live outside ``src/data``.
+
+    Resolution order:
+    1. An empty value falls back to ``data_root()``.
+    2. Absolute paths (after ``~`` expansion) are used as-is.
+    3. Relative to the current working directory, if that exists.
+    4. Relative to ``data_root()`` (the historical behavior), if that exists.
+    5. Relative to the repository root, if that exists.
+
+    If no candidate exists, the ``data_root()`` candidate is returned so callers
+    surface a consistent "dataset not found" error.
+    """
+    root = Path(ds_root).expanduser()
+    if str(root) in ("", "."):
+        return data_root()
+    if root.is_absolute():
+        return root
+    for candidate in (Path.cwd() / root, data_root() / root, repo_root() / root):
+        if candidate.exists():
+            return candidate.resolve()
+    return data_root() / root
+
+
 def data_spec(name: str) -> Path:
     """Path to the datasets in (src/data/)."""
     match name.lower():

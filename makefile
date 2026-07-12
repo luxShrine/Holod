@@ -8,7 +8,7 @@ PYTHON_INTERPRETER := python
 
 # Directories
 SRC_DIR      := src
-TESTS     	 := $(SRC_DIR)/tests/check_training.py
+TESTS     	 := $(SRC_DIR)/tests/check_training.py $(SRC_DIR)/tests/check_dataset_config.py
 BUILD_DIRS   := build dist .pytest_cache .ruff_cache .mypy_cache .coverage htmlcov
 
 #################################################################################
@@ -20,6 +20,15 @@ BUILD_DIRS   := build dist .pytest_cache .ruff_cache .mypy_cache .coverage htmlc
 .PHONY: requirements
 requirements:
 	uv sync	
+
+## Delete all checkpoints, reports
+.PHONY: clear
+clear:
+	find reports/ -type f -name "*.json" -delete
+	find reports/ -type f -name "*.html" -delete
+	find reports/ -type f -name "*.csv" -delete
+	find src/checkpoints/ -type f -name "*.pth" -delete
+	find src/checkpoints/  -type f -name "*.tar" -delete
 
 ## Delete all compiled Python files
 .PHONY: clean
@@ -81,7 +90,12 @@ check: requirements typecheck test
 train: requirements
 	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py train
 
-## Generate plots 
+## Compare model backbones under one shared configuration
+.PHONY: compare
+compare: requirements
+	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py compare
+
+## Generate plots
 .PHONY: plot
 plot: requirements
 	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py plot-train

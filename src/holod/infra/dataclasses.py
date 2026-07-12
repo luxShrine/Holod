@@ -49,15 +49,25 @@ SAMPLE_PATH: Path = paths.data_root() / Path("MW_Dataset_Sample") / Path("ODP-DL
 type FieldsUnion = Paths | Train | Flags
 
 
-def check_csv_exists(create_csv: bool, ds_root: str, meta_csv_name: str):
+def check_csv_exists(create_csv: bool, ds_root: Path, meta_csv_name: str) -> tuple[bool, str]:
+    """Validate the dataset root and its metadata CSV, prompting the user as needed.
+
+    ``ds_root`` must already be resolved (see ``paths.resolve_dataset_root``), so
+    dataset folders outside ``src/data`` work the same as bundled ones.
+
+    Returns:
+        ``(use_sample_data, meta_csv_name)`` where ``meta_csv_name`` reflects any
+        CSV created during the check.
+
+    """
     use_sample_data = False
     # parse user input and whether csv or data exists
     create_csv_option: CreateCSVOption
     if create_csv:
         create_csv_option = CreateCSVOption.CSV_CREATE
-    elif (paths.data_root() / Path(ds_root) / Path(meta_csv_name)).exists():
+    elif meta_csv_name and (ds_root / meta_csv_name).is_file():
         create_csv_option = CreateCSVOption.CSV_VALID
-    elif (paths.data_root() / Path(ds_root)).exists():
+    elif ds_root.is_dir():
         create_csv_option = CreateCSVOption.CSV_MISSING
     else:
         create_csv_option = CreateCSVOption.CSV_DATA_MISSING
@@ -81,8 +91,8 @@ def check_csv_exists(create_csv: bool, ds_root: str, meta_csv_name: str):
             )
             if user_response.lower() == "create":
                 # run it through again with create csv option
-                check_csv_exists(True, ds_root, meta_csv_name)
-            elif user_response.lower() == "sample":
+                return check_csv_exists(True, ds_root, meta_csv_name)
+            if user_response.lower() == "sample":
                 use_sample_data = True
             else:
                 raise RuntimeError("failed to parse user choice for creating CSV.")
@@ -91,12 +101,21 @@ def check_csv_exists(create_csv: bool, ds_root: str, meta_csv_name: str):
             logger.info(f"Path to csv exists {meta_csv_name}, continuing...")
 
         case CreateCSVOption.CSV_CREATE:
+            if not ds_root.is_dir():
+                raise click.ClickException(
+                    f"Cannot create a CSV: dataset folder does not exist at {ds_root}"
+                )
             # parse the create input here as to allow for the user to select the desire to
             # create a csv if the data is missing
-            csv_name: str = click.prompt("Enter a filename for csv", type=click.STRING)
-            HologramFocusDataset.create_meta(Path(ds_root), csv_name)
+            csv_name: str = click.prompt(
+                "Enter a filename for csv",
+                type=click.STRING,
+                default=meta_csv_name or "ODP-DLHM-Database.csv",
+            )
+            HologramFocusDataset.create_meta(ds_root, csv_name)
+            meta_csv_name = csv_name
 
-    return use_sample_data
+    return (use_sample_data, meta_csv_name)
 
 
 # TODO: potentially compress some of these fields to utilize the flags, paths, and train classes
@@ -262,7 +281,13 @@ class AutoConfig:
         create_csv = False if create_csv is None else create_csv
         ds_root = "" if ds_root is None else ds_root
         meta_csv_name = "" if meta_csv_name is None else meta_csv_name
-        use_sample_data = check_csv_exists(create_csv, ds_root, meta_csv_name)
+        # resolve the dataset root so folders outside src/data (absolute, ``~``, or
+        # cwd-relative paths) load the same way bundled datasets do
+        ds_root_path = paths.resolve_dataset_root(ds_root)
+        if not use_sample_data:
+            (use_sample_data, meta_csv_name) = check_csv_exists(
+                create_csv, ds_root_path, meta_csv_name
+            )
 
         # WARN: not robust for all types, will need a change <05-09-25>
         if backbone_type == ModelType.VIT and crop_size != 224:
@@ -281,10 +306,11 @@ class AutoConfig:
             else:
                 raise Exception(f"Path to sample data does not exist: {SAMPLE_PATH}")
         else:
-            meta_csv_strpath = (paths.data_root() / ds_root / Path(meta_csv_name)).as_posix()
+            meta_csv_strpath = (ds_root_path / meta_csv_name).as_posix()
 
         # ensure not None
         backbone_type = backbone_type if backbone_type is not None else ModelType.ENET
+        device_user = device_user if device_user is not None else UserDevice.CUDA.value
         batch_size = batch_size if batch_size is not None else 16
         checkpoint = checkpoint if checkpoint is not None else False
         crop_size = crop_size if crop_size is not None else 224

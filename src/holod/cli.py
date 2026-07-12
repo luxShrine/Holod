@@ -23,6 +23,7 @@ def cli():
 
 
 @cli.command()
+@click.argument("ds_root", required=False, default=None, type=click.Path(file_okay=False))
 @click.option(
     "--csv-name",
     "meta_csv_name",
@@ -97,6 +98,7 @@ def cli():
 @click.option("--create-csv", "create_csv", default=None, help="Create a CSV for data.")
 @click.option("--sample", "use_sample_data", default=None, help="Use sample data provided.")
 def train(
+    ds_root: str | None,
     meta_csv_name: str | None,
     num_classes: int | None,
     backbone: str | None,
@@ -111,7 +113,12 @@ def train(
     create_csv: bool | None,
     use_sample_data: bool | None,
 ) -> None:
-    """Train the autofocus model based on supplied dataset."""
+    """Train the autofocus model based on supplied dataset.
+
+    DS_ROOT is the dataset folder; it may be a name under src/data, a path
+    relative to the current directory, or an absolute path anywhere on disk.
+    When omitted, the dataset_root from train_settings.toml is used.
+    """
     from serde.toml import from_toml
 
     from holod.infra.dataclasses import AutoConfig, Flags, Paths, Train, UserConfig
@@ -127,11 +134,11 @@ def train(
     path_ckpt: str | None = None
     if Path("train_settings.toml").exists():
         with open("train_settings.toml") as config_file:
-            config = config_file.read()
-        config = from_toml(UserConfig, config)
+            config_text = config_file.read()
+        config = from_toml(UserConfig, config_text)
         # merge the config file (if it exists), by overwriting it with CLI args
         config.merge(
-            paths=Paths(None, meta_csv_name),
+            paths=Paths(ds_root, meta_csv_name),
             train=Train(
                 backbone,
                 batch_size,
@@ -149,6 +156,36 @@ def train(
             flags=Flags(continue_train, create_csv, fixed_seed, use_sample_data),
         )
         if (config.flags.checkpoint or continue_train) is True:
+            latest_ckpt = checkpoints_loc() / "latest_checkpoint.tar"
+            if latest_ckpt.exists():
+                path_ckpt = latest_ckpt.as_posix()
+            else:
+                logger.warning(f"No checkpoint found at {latest_ckpt}, starting fresh.")
+        autofocus_config = config.to_auto_config()
+
+    elif ds_root is not None:
+        # no config file, but a dataset was supplied on the CLI: build the config
+        # purely from CLI arguments so external dataset folders still work
+        logger.warning("Config file 'train_settings.toml' not found, using CLI arguments only.")
+        config = UserConfig(
+            paths=Paths(ds_root, meta_csv_name),
+            train=Train(
+                backbone,
+                batch_size,
+                crop_size,
+                device_user,
+                epoch_count,
+                learning_rate,
+                num_classes,
+                None,
+                None,
+                None,
+                None,
+                val_split,
+            ),
+            flags=Flags(continue_train, create_csv, fixed_seed, use_sample_data),
+        )
+        if continue_train is True:
             latest_ckpt = checkpoints_loc() / "latest_checkpoint.tar"
             if latest_ckpt.exists():
                 path_ckpt = latest_ckpt.as_posix()
