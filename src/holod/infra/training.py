@@ -566,7 +566,7 @@ def init_training(core_trainer: CoreTrainer, ckpt: ModelCheckpoint | None):
     # Paths
     checkpoint_dir = checkpoints_loc()
     checkpoint_dir.mkdir(exist_ok=True)
-    device = torch.cuda.get_device_name() if core_trainer.device == "cuda" else "cpu"
+    device = "cuda" if core_trainer.device == "cuda" else "cpu"
     return checkpoint_dir, labels_tensor, epoch_metric, avg_loss_train, avg_loss_val, device
 
 
