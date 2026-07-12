@@ -151,6 +151,8 @@ rich_handler = RichHandler(
     tracebacks_show_locals=True,
     # tracebacks_suppress=["click", "typer"],
     show_path=True,
+    # in colab environment setting this to true this prints an invalid escape sequence
+    enable_link_path=False 
 )
 rich_handler.setLevel(logging.INFO)
 

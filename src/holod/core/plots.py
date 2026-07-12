@@ -21,10 +21,10 @@ from plotly.subplots import make_subplots
 from polars import DataFrame
 from scipy.stats import gaussian_kde
 from serde import serde
-from serde.json import to_json
+from serde.json import from_json, to_json
 from sklearn.metrics import confusion_matrix
 
-from holod.infra.dataclasses import AutoConfig, CoreTrainer, TrainingRepeatConfig
+from holod.infra.dataclasses import CoreTrainer, TrainingOutput, TrainingRepeatConfig
 from holod.infra.log import get_logger
 from holod.infra.util.paths import report_path
 from holod.infra.util.prog_helper import track_progress
@@ -40,10 +40,10 @@ logger = get_logger(__name__)
 class PlotMeta:
     """Plotting metadata storage."""
 
-    slug: str = field(init=False, default_factory=str)
     title: str
     caption: str
     tags: list[str]  # e.g., ["autofocus", "fft"]
+    slug: str = field(init=False, default_factory=str)
     kind: Literal["result", "diagnostic"] = "result"
     thumb: str | None = field(init=False, default_factory=str)
     page: str | None = field(init=False, default_factory=str)
@@ -76,6 +76,22 @@ class PlotPred:
     display: str
     analysis: str
     repeat_config: TrainingRepeatConfig
+
+    def save_to_file(self):
+        # backbone + full date in the name: back-to-back runs (e.g. `holod compare`
+        # training several backbones) must not overwrite each other's predictions
+        backbone = self.repeat_config.user_config.train.backbone or "unknown"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        file_path = report_path() / f"plot_info_{backbone}_{stamp}.json"
+        with open(file_path, "w", encoding="utf-8") as f:
+            plot_info_json = to_json(self, PlotPred)
+            f.write(plot_info_json)
+        logger.info(f"Training predictions saved to {file_path}")
+
+    @classmethod
+    def load_from_file(cls, path_to_file: Path):
+        json_s = path_to_file.read_text()
+        return from_json(cls, json_s)
 
     # TODO: incorporate into the classification func <luxShrine>
     def plot_violin_depth_bins(self) -> list[PlotCollection] | None:
@@ -110,7 +126,9 @@ class PlotPred:
             # choose depth bins so each violin has ~50 points, tweak divisor
             n_bins = max(10, len(depth_um) // 50)
             np.linspace(depth_um.min(), depth_um.max(), n_bins + 1, dtype=np.float64)
-            bin_idx = np.digitize(depth_um, self.bin_edges) - 1  # → 0 … n_bins-1
+            bin_idx = (
+                np.digitize(depth_um, self.bin_edges) - 1  # pyright: ignore[reportCallIssue, reportArgumentType]
+            )  # → 0 … n_bins-1
 
             df = pl.DataFrame(
                 {
@@ -133,42 +151,8 @@ class PlotPred:
             export.append(PlotCollection(meta, fig))
         return export
 
-    def plot_classification(
-        self, display_override: DisplayType | None = None
-    ) -> list[dict[str, Any]] | None:
-        """Plot actual vs. predicted values and a confusion matrix for classification."""
-        # unpack/reconfigure data
-        self.display = display_override if display_override is not None else self.display
-        z_val_pred_min = self.z_val_pred.min()
-        z_train_pred_min = self.z_train_pred.min()
-        data = {
-            "z_val": self.z_val,
-            "z_train": self.z_train,
-            "z_val_pred": self.z_val_pred,
-            "z_train_pred": self.z_train_pred,
-        }
-
-        cm_title = self.titles["cl_cm"]
-        scatter_title = self.titles["cl_res"]
-
-        # Convert to µm for plotting, concat creates null values automatically since
-        # prediction and evaluation arrays aren't the same size
-        df: DataFrame = pl.concat(
-            # items=[pl.DataFrame({name: (val * 1e6)}) for name, val in data.items()],
-            items=[pl.DataFrame({name: val}) for name, val in data.items()],
-            how="horizontal",
-        )
-        # even if some values are null (due to above) it will not be passed into the
-        # plot as long as there are values in each bin
-        residual_val = pl.col("z_val_pred") - pl.col("z_val")
-        residual_train = pl.col("z_train_pred") - pl.col("z_train")
-        df: DataFrame = df.with_columns((residual_val).alias("residual_val"))
-        df: DataFrame = df.with_columns((residual_train).alias("residual_train"))
-        # libraries like scipy and numpy dont play nicely with null values,
-        # separate df for numerical manipulation
-        df_filled: DataFrame = df.fill_null(0)
-
-        # -- Confusion Matrix plot ---------------------------------------------------------------
+    def confusion_matrix(self, model_name: str):
+        """Confusion Matrix plot."""
         # Ensure bin_edges is not None and is a numpy array for classification
         if self.bin_edges is None:
             raise Exception("bin_edges not provided in PlotPred. Plotting failed.")
@@ -204,7 +188,7 @@ class PlotPred:
             reversescale=False,
         )
         _ = fig_cm.update_layout(
-            title_text="Confusion Matrix (Validation Set)",
+            title_text=f"Confusion Matrix (Validation Set) | {model_name}",
             xaxis_title_text="Predicted Label (Physical Bin Center)",
             yaxis_title_text="True Label (Physical Bin Center)",
             xaxis={
@@ -220,8 +204,34 @@ class PlotPred:
                 "autorange": "reversed",
             },  # Reversed to match typical CM layout
         )
+        return fig_cm
 
-        # -- Scatter plot ------------------------------------------------------------------------
+    def scatter(self, model_name: str):
+        """Scatter plot."""
+        z_val_pred_min = self.z_val_pred.min()
+        z_train_pred_min = self.z_train_pred.min()
+        data = {
+            "z_val": self.z_val,
+            "z_train": self.z_train,
+            "z_val_pred": self.z_val_pred,
+            "z_train_pred": self.z_train_pred,
+        }
+        # Convert to µm for plotting, concat creates null values automatically since
+        # prediction and evaluation arrays aren't the same size
+        df: DataFrame = pl.concat(
+            # items=[pl.DataFrame({name: (val * 1e6)}) for name, val in data.items()],
+            items=[pl.DataFrame({name: val}) for name, val in data.items()],
+            how="horizontal",
+        )
+        # even if some values are null (due to above) it will not be passed into the
+        # plot as long as there are values in each bin
+        residual_val = pl.col("z_val_pred") - pl.col("z_val")
+        residual_train = pl.col("z_train_pred") - pl.col("z_train")
+        df = df.with_columns((residual_val).alias("residual_val"))
+        df = df.with_columns((residual_train).alias("residual_train"))
+        # libraries like scipy and numpy dont play nicely with null values,
+        # separate df for numerical manipulation
+        df_filled: DataFrame = df.fill_null(0)
 
         # scipy estimates the probability density function of random points using
         # Gaussian kernels. This is generated and then applied to the stacked
@@ -338,7 +348,6 @@ class PlotPred:
             col=2,
         )
 
-        # --Finish -------------------------------------------------------------------------------
         # Scatter
         _ = fig.update_xaxes(title="Focus Depth (µm)", row=1, col=1)
         _ = fig.update_yaxes(title="Residual (µm)", row=1, col=1)
@@ -347,26 +356,48 @@ class PlotPred:
 
         _ = fig.update_layout(
             # template="plotly_white",
-            title_text=scatter_title,
+            title_text=f"Scatter Residual Plot (Validation Set) | {model_name}",
             legend_title_text="Legend",
             hovermode="closest",
             legend={"yanchor": "top", "y": 0.99, "xanchor": "left", "x": 0.01},
         )
+        return fig
+
+    def plot_classification(
+        self, display_override: DisplayType | None = None, timestamp: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        """Plot actual vs. predicted values and a confusion matrix for classification."""
+        # unpack/reconfigure data
+        display = display_override if display_override is not None else DisplayType(self.display)
+        model_name = self.repeat_config.user_config.train.backbone
+        model_name = "" if model_name is None else model_name
+
+        cm_title = self.titles["cl_cm"]
+        scatter_title = self.titles["cl_res"]
+
+        fig_cm = self.confusion_matrix(model_name)
+        fig_scatter = self.scatter(model_name)
 
         meta_cm = PlotMeta(
-            cm_title,
-            "Confusion matrix for classification.",
-            ["Classification", "Confusion Matrix"],
-            "result",
+            title=cm_title,
+            caption="Confusion matrix for classification.",
+            tags=["Classification", "Confusion Matrix"],  # pyright: ignore[reportArgumentType]
+            kind="result",  # pyright: ignore[reportArgumentType]
         )
         meta_scatter = PlotMeta(
-            scatter_title,
-            "Scatter-plot for classification.",
-            ["Classification", "Scatter", "Training", "Validation"],
-            "result",
+            title=scatter_title,
+            caption="Scatter-plot for classification.",
+            tags=["Classification", "Scatter", "Training", "Validation"],  # pyright: ignore[reportArgumentType]
+            kind="result",  # pyright: ignore[reportArgumentType]
         )
         # self.plot_violin_depth_bins()
-        return repeat(self.repeat_config, [fig_cm, fig], [meta_cm, meta_scatter], self.display)
+        return repeat(
+            self.repeat_config,
+            [fig_cm, fig_scatter],
+            [meta_cm, meta_scatter],
+            display,
+            timestamp,
+        )
 
     def plot_regression_residual(self) -> list[PlotCollection] | None:
         """Plot residual vs true depth."""
@@ -521,42 +552,46 @@ class PlotPred:
         return export
 
     def plot_regression(
-        self, display_override: DisplayType | None = None
+        self, display_override: DisplayType | None = None, timestamp: str | None = None
     ) -> list[dict[str, Any]] | None:
         """Combine plotting functions involved in regression to get one result."""
-        self.display = display_override if display_override is not None else self.display
+        display = display_override if display_override is not None else DisplayType(self.display)
         fig_list: list[go.Figure] = []
         meta_list: list[PlotMeta] = []
-        merged_list: list[PlotCollection] = (
-            self.plot_regression_residual() + self.plot_hexbin_with_marginals()
-        )
+        residual = self.plot_regression_residual()
+        hexbin = self.plot_hexbin_with_marginals()
+        merged_list = []
+        if residual is not None:
+            merged_list.extend(residual)
+        if hexbin is not None:
+            merged_list.extend(hexbin)
 
         for p in merged_list:
             meta_list.append(p.meta)
             fig_list.append(p.figure)
 
-        return repeat(self.repeat_config, fig_list, meta_list, self.display)
+        return repeat(self.repeat_config, fig_list, meta_list, display, timestamp)
 
     @classmethod
     def from_z_preds(
         cls,
-        auto_config: AutoConfig,
         bin_edges: Arr64 | None,
-        train_cfg: CoreTrainer,
-        avg_train_loss,
-        avg_val_loss,
-        repeat_config: TrainingRepeatConfig,
+        core_trainer: CoreTrainer,
+        training_output: TrainingOutput,
         bin_centers: Arr64 | None = None,
         z_avg: float | None = None,
         z_std: float | None = None,
     ) -> PlotPred:
-        _: nn.Module = train_cfg.model.eval()  # set model into valuation rather than training mode
-        _ = train_cfg.model.to(auto_config.device())  # ensure model is on expected device
+        device = core_trainer.device
+        _: nn.Module = (
+            core_trainer.model.eval()
+        )  # set model into valuation rather than training mode
+        _ = core_trainer.model.to(device)  # ensure model is on expected device
         val_z_pred_list: list[Arr64] = []
         val_z_true_list: list[Arr64] = []
         train_z_pred_list: list[Arr64] = []
         train_z_true_list: list[Arr64] = []
-        analysis = auto_config.analysis
+        analysis = core_trainer.analysis
 
         titles: dict[str, str] = {}
         if analysis == AnalysisType.CLASS:
@@ -571,24 +606,25 @@ class PlotPred:
                 titles[f"reg_den_{t}"] = f"Prediction density ({t})"
 
         with torch.no_grad():
-            for loader in [train_cfg.train_loader, train_cfg.val_loader]:
+            for loader in [core_trainer.train_loader, core_trainer.val_loader]:
+                current_step = "training" if loader is core_trainer.train_loader else "evaluation"
                 for imgs, labels in track_progress(
-                    loader, f"Gathering z predictions using {auto_config.device()}..."
+                    loader, f"Gathering z predictions from {current_step} using {device}..."
                 ):
                     # non_blocking means allowing for multiple tensors to be sent to device
-                    imgs_tens = imgs.to(auto_config.device(), non_blocking=True)
-                    labels_tens = labels.to(auto_config.device(), non_blocking=True)
+                    imgs_tens = imgs.to(device, non_blocking=True)
+                    labels_tens = labels.to(device, non_blocking=True)
                     assert (
-                        next(train_cfg.model.parameters()).device
+                        next(core_trainer.model.parameters()).device
                         == imgs_tens.device
                         == labels_tens.device
                     ), (
                         f"Images {imgs_tens.device}, labels {labels_tens.device}, or train model \
-                        {next(train_cfg.model.parameters()).device} not on same device."
+                        {next(core_trainer.model.parameters()).device} not on same device."
                     )
 
                     # pass in data to train_cfg.model
-                    preds = train_cfg.model(imgs_tens)
+                    preds = core_trainer.model(imgs_tens)
                     # convert back to physical units
                     if analysis.value == AnalysisType.REG.value:
                         if z_avg is None or z_std is None:
@@ -615,7 +651,7 @@ class PlotPred:
                     else:
                         raise Exception("Unknown analysis value")
 
-                    if loader == train_cfg.train_loader:
+                    if loader == core_trainer.train_loader:
                         train_z_pred_list.append(preds_batch)
                         train_z_true_list.append(true_batch)
                     else:
@@ -633,9 +669,9 @@ class PlotPred:
         val_err: Arr64 = np.abs(val_z_pred - val_z_true)
 
         repeat_config = TrainingRepeatConfig(
-            auto_config.to_user_config(),
-            avg_train_loss,
-            avg_val_loss,
+            core_trainer.a_cfg.to_user_config(),
+            training_output.avg_train_loss,
+            training_output.avg_val_loss,
         )
 
         return cls(
@@ -648,7 +684,7 @@ class PlotPred:
             bin_edges,
             titles,
             "save",
-            auto_config.analysis.value,
+            core_trainer.analysis.value,
             repeat_config,
         )
 
@@ -658,11 +694,12 @@ def repeat(
     in_fig: Plots,
     meta: list[PlotMeta],
     display: DisplayType,
+    timestamp: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """Store the results of the training metrics in a repeatable format."""
     report: Path = report_path()
-    current_time = datetime.now()
-    current_time = current_time.strftime("%H%M%S")
+    # "E" prefix marks a timestamp generated at plot time, not tied to a source plot_info json
+    current_time = timestamp if timestamp is not None else "E" + datetime.now().strftime("%H%M%S")
     current_results: Path = report / f"results_{current_time}.json"
 
     json_report: str = to_json(repeat_config, TrainingRepeatConfig)
@@ -677,11 +714,11 @@ def repeat(
         png_path: str = f"{report_path(True) / Path(m.slug)}_{current_time}.png"
         match fig:
             case go.Figure():  # plotly
-                logger.info("Processing plotly figure for meta...")
+                logger.debug("Processing plotly figure for meta...")
                 html_path: str = f"{report_path(True) / Path(m.slug)}_{current_time}.html"
                 if display is not DisplayType.SHOW:
                     # Self-contained HTML (includes Plotly JS via CDN for lighter page weight)
-                    fig.write_html(html_path, full_html=True, include_plotlyjs="cdn")
+                    fig.write_html(html_path, full_html=True, include_plotlyjs="cdn")  # pyright: ignore[reportArgumentType]
                 if display is not DisplayType.SAVE and display is not DisplayType.META:
                     logger.info("Displaying plot...")
                     fig.show()
@@ -711,7 +748,6 @@ def repeat(
         except Exception as e:
             logger.error("Error saving image, ensure you have chromium installed.")
             raise e
-    logger.info("All plots processed.")
     return None
 
 
@@ -733,7 +769,7 @@ def plot_amp_phase(
     from holod.core.metrics import wrap_phase
     from holod.core.optics.reconstruction import torch_recon
 
-    hologram, amp_recon, phase_recon, focus_tc = torch_recon(
+    _hologram, amp_recon, phase_recon, focus_tc = torch_recon(
         img_file_path, wavelength, ckpt_file, crop_size, dx
     )
 
@@ -783,12 +819,12 @@ def plot_amp_phase(
         fig, axes = plt.subplots(2, 2, figsize=(8, 6))
         (ax_ar, ax_blank1, ax_pr, ax_blank2) = axes.flatten()
 
-        im1: AxesImage = ax_ar.imshow(amp_recon, cmap="gray")
+        im1 = ax_ar.imshow(amp_recon, cmap="gray")
         ax_ar.set_title("Amplitude reconstruction")
         cbar_ar = fig.colorbar(im1, ax=ax_ar, shrink=0.8)
         cbar_ar.set_label("Intensity value (0 to 1)")
 
-        im_phase_recon: AxesImage = ax_pr.imshow(phase_recon, cmap="twilight", vmin=vmin, vmax=vmax)
+        im_phase_recon = ax_pr.imshow(phase_recon, cmap="twilight", vmin=vmin, vmax=vmax)
         ax_pr.set_title("Phase reconstruction")
         cbar_phase = fig.colorbar(im_phase_recon, ax=ax_pr, shrink=0.8)
         cbar_phase.set_label("Phase value (radians)")

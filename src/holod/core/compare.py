@@ -19,11 +19,17 @@ from serde.json import to_json
 from torchvision.transforms import v2
 
 from holod.core.optics.reconstruction import dlhm_effective_z_mm, focus_score
-from holod.infra.dataclasses import AutoConfig
+from holod.core.plots import PlotPred
+from holod.infra.dataclasses import AutoConfig, create_autofocus_model
 from holod.infra.dataset import HologramFocusDataset
 from holod.infra.log import console_ as console
 from holod.infra.log import get_logger
-from holod.infra.training import Checkpoint, ModelCheckpoint, train_eval_epoch, transform_ds
+from holod.infra.training import (
+    Checkpoint,
+    ModelCheckpoint,
+    create_training_setup,
+    train_eval_epoch,
+)
 from holod.infra.util.image_processing import crop_max_square
 from holod.infra.util.paths import checkpoints_loc, report_path
 from holod.infra.util.types import (
@@ -171,8 +177,11 @@ class ComparisonReport:
     def save(self, directory: Path | None = None) -> tuple[Path, Path]:
         """Serialize the report to JSON and CSV, returning both file paths."""
         out_dir = directory if directory is not None else report_path()
-        json_path = out_dir / "backbone_comparison.json"
-        csv_path = out_dir / "backbone_comparison.csv"
+        # stamp the filenames with the report's creation time so successive compare
+        # runs accumulate instead of overwriting the previous run's statistics
+        stamp = datetime.fromisoformat(self.created).strftime("%Y%m%d-%H%M%S")
+        json_path = out_dir / f"backbone_comparison_{stamp}.json"
+        csv_path = out_dir / f"backbone_comparison_{stamp}.csv"
         with open(json_path, "w", encoding="utf-8") as f:
             f.write(to_json(self, ComparisonReport))
         pl.DataFrame([asdict(s) for s in self.stats]).write_csv(csv_path)
@@ -236,7 +245,7 @@ class ComparisonReport:
         for col, (title, values, spec) in enumerate(panels, start=1):
             _ = fig.add_trace(
                 go.Bar(
-                    y=names,
+                    y=names,  # pyright: ignore[reportArgumentType]
                     x=values,
                     orientation="h",
                     marker_color=colors,
@@ -334,7 +343,7 @@ def resolve_crop_size(backbone: ModelType, crop_size: int) -> int:
 def collect_model_stats(a_cfg: AutoConfig) -> BackboneStats:
     """Collect static architecture and inference-speed statistics for one backbone."""
     channels = 3 if a_cfg.backbone in PRETRAINED_BACKBONES else 1
-    model = a_cfg.create_model()
+    model = create_autofocus_model(a_cfg)
     (total, trainable) = _count_parameters(model)
     entry = BackboneStats(
         backbone=a_cfg.backbone.value,
@@ -361,10 +370,10 @@ def _fill_training_stats(
     entry: BackboneStats, a_cfg: AutoConfig, base: HologramFocusDataset
 ) -> None:
     """Train one backbone with the standard pipeline and record its results in-place."""
-    core_trainer = transform_ds(base, a_cfg)
+    core_trainer = create_training_setup(base, a_cfg)
     best_val_metric = float("inf") if a_cfg.analysis == AnalysisType.REG else -float("inf")
     start = time.perf_counter()
-    output = train_eval_epoch(core_trainer, a_cfg, best_val_metric, None)
+    output = train_eval_epoch(core_trainer, best_val_metric, None)
     elapsed = time.perf_counter() - start
     entry.trained = True
     entry.train_time_s = elapsed
@@ -373,6 +382,19 @@ def _fill_training_stats(
     entry.avg_val_loss = output.avg_val_loss
     entry.best_val_metric = output.best_val_metric
     entry.val_mae_mm = output.val_mae_mm
+    # persist the per-sample predictions exactly like an individual `holod train`
+    # run does, using the same dataset the backbone was trained on
+    bin_centers = base.bin_centers if a_cfg.analysis == AnalysisType.CLASS else None
+    (z_avg, z_std) = core_trainer.get_std_avg(a_cfg.analysis)
+    plot_pred = PlotPred.from_z_preds(
+        core_trainer=core_trainer,
+        bin_centers=bin_centers,
+        training_output=output,
+        bin_edges=base.bin_edges,
+        z_avg=z_avg,
+        z_std=z_std,
+    )
+    plot_pred.save_to_file()
 
 
 def compare_backbones(
@@ -584,7 +606,7 @@ class HologramComparisonReport:
         )
         _ = fig.add_trace(
             go.Bar(
-                y=names,
+                y=names,  # pyright: ignore[reportArgumentType]
                 x=[e.z_pred_mm for (_i, e) in plotted],
                 orientation="h",
                 marker_color=colors,
@@ -600,7 +622,7 @@ class HologramComparisonReport:
         )
         _ = fig.add_trace(
             go.Bar(
-                y=names,
+                y=names,  # pyright: ignore[reportArgumentType]
                 x=[e.focus_tc for (_i, e) in plotted],
                 orientation="h",
                 marker_color=colors,
@@ -655,23 +677,23 @@ def _load_checkpoint_model(
         torch_dict: dict[str, Any] = torch.load(ckpt_path, weights_only=True, map_location=device)
     # best-model .pth files hold a flat Checkpoint dict; latest_checkpoint.tar nests it
     ckpt = Checkpoint.from_dict(torch_dict.get("checkpoint", torch_dict))
-    cfg = AutoConfig(
+    a_cfg = AutoConfig(
         analysis=AnalysisType.REG if ckpt.bin_centers is None else AnalysisType.CLASS,
         backbone=ckpt.model_type,
         num_classes=ckpt.num_classes,
     )
-    model = cfg.create_model().to(torch.device(device))
+    model = create_autofocus_model(a_cfg).to(torch.device(device))
     incompatible = model.load_state_dict(ckpt.model_state_dict)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         logger.warning(f"State dict load mismatch for {ckpt_path.name}: {incompatible}")
-    if cfg.analysis == AnalysisType.REG and (ckpt.z_avg is None or ckpt.z_std is None):
+    if a_cfg.analysis == AnalysisType.REG and (ckpt.z_avg is None or ckpt.z_std is None):
         # checkpoints written before z_avg/z_std were saved cannot be de-normalized
         logger.warning(
             f"Checkpoint {ckpt_path.name} lacks z_avg/z_std normalization stats; "
             + "regression output will be taken as-is."
         )
     _ = model.eval()
-    return (model, cfg, ckpt)
+    return (model, a_cfg, ckpt)
 
 
 def _hologram_tensor(

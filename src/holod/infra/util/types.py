@@ -95,14 +95,14 @@ class ModelType(Enum):
     ENET: 3 channels, pretrained
     VIT: 3 channels, pretrained
     RESNET: 3 channels, pretrained
-    NEW: 1 channel, untrained
+    PHYSICSCNN: 1 channel, untrained
     FOCUSNET: 1 channel, untrained
     """
 
     ENET = "efficientnet"
     VIT = "vit"
     RESNET = "resnet50"
-    NEW = "new"
+    PCNN = "new"
     FOCUSNET = "focusnet"
 
 

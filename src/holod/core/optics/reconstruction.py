@@ -7,7 +7,7 @@ import torch.nn as nn
 from PIL import Image
 from torchvision.transforms import v2
 
-from holod.infra.dataclasses import AutoConfig
+from holod.infra.dataclasses import AutoConfig, create_autofocus_model
 from holod.infra.log import get_logger
 from holod.infra.util.image_processing import crop_max_square
 from holod.infra.util.types import (
@@ -49,7 +49,7 @@ def torch_recon(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt: dict[str, Any] = torch.load(ckpt_file, map_location=device, weights_only=False)
 
-    ## WARN: Fragile loading process...
+    # WARN: Fragile loading process...
     bin_centers = ckpt["bin_centers"]
     # z normalization stats; absent on classification and pre-existing checkpoints
     z_avg = ckpt.get("z_avg")
@@ -60,7 +60,7 @@ def torch_recon(
         num_classes=ckpt["num_classes"],
     )
 
-    model = cfg.create_model().to(device)
+    model = create_autofocus_model(cfg).to(device)
     incomp = model.load_state_dict(ckpt["model_state_dict"])
     if getattr(incomp, "missing_keys", None) or getattr(incomp, "unexpected_keys", None):
         logger.warning(
@@ -215,8 +215,6 @@ def recon_inline(
             kz = np.sqrt(np.maximum(0, k_sq - kxy_sq)) + (i * np.sqrt(np.maximum(0, kxy_sq - k_sq)))
             Ha = np.exp(i * z * kz)
             U1 = np.fft.ifft2(np.fft.fft2(field) * Ha)
-        case _:
-            raise ValueError("method must be 'fresnel' or 'angular'")
 
     # Remove padding
     if pad:

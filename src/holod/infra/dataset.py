@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, override
 
 import numpy as np
 import numpy.typing as npt
 import polars as pl
+import torch
 from PIL import Image
 from PIL.Image import Image as ImageType
+from torch import Tensor, nn
 from torch.utils.data import Dataset
+from torchvision.transforms import v2
 
 import holod.infra.util.paths as paths
 from holod.infra.log import get_logger
@@ -19,7 +23,9 @@ from holod.infra.util.types import (
     Arr32,
     Arr64,
     Mean,
+    ModelType,
     StandardDev,
+    SubsetImageDepth,
 )
 
 if TYPE_CHECKING:
@@ -62,7 +68,7 @@ class HologramDepths:
             return self.z_array[idx]
         if isinstance(idx, slice):
             return self.z_array[idx.start : idx.stop : idx.step]
-        raise TypeError("Invalid index type")  # pyright: ignore[reportUnreachable]
+        return None
 
     def subset_mean_std(self, subset_indices: Sequence[int]) -> tuple[Mean, StandardDev]:
         """Get the mean and standard deviation for a subset of the z depths."""
@@ -154,7 +160,7 @@ class HologramFocusDataset(Dataset[tuple[ImageType, np.float64 | int]]):
         return len(self.records)
 
     @override
-    def __getitem__(self, idx: int) -> tuple[ImageType, np.float64 | np.int64]:
+    def __getitem__(self, idx: int) -> tuple[ImageType, np.float64 | np.int64]:  # pyright: ignore[reportIncompatibleMethodOverride]
         """Return image and z depth value."""
         # ensure image is read properly
         try:
@@ -163,7 +169,7 @@ class HologramFocusDataset(Dataset[tuple[ImageType, np.float64 | int]]):
             logger.exception(f"Error loading image {self.paths[idx]}: {e}")
             raise
         # Continuous if regression, bins if classification
-        label: np.float64 | np.int64 = (
+        label: np.float64 | np.int64 = (  # pyright: ignore[reportAssignmentType]
             self.z[idx] if self.mode == AnalysisType.REG else self.z_bins[idx]
         )
 
@@ -230,3 +236,126 @@ class HologramFocusDataset(Dataset[tuple[ImageType, np.float64 | int]]):
         df.write_csv(full_csv_path, separator=";")
 
         return df
+
+
+# Label transforms must be picklable so DataLoader workers (spawn on Windows)
+# can serialize the dataset; locals/lambdas inside transform_ds break that.
+@dataclass
+class RegLabelTransform:
+    """Normalize a physical z-value into a float tensor using training-set stats."""
+
+    z_avg: float
+    z_std: float
+
+    def __call__(self, z_raw: np.float32) -> Tensor:
+        """Pass in physical value, return normalized z tensor."""
+        z_tensor = torch.as_tensor(z_raw, dtype=torch.float32)
+        return (z_tensor - self.z_avg) / self.z_std
+
+
+class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
+    """Transform the input dataset by applying transfomations to it's contents.
+
+    By wrapping the underlying dataset in this class, we can ensure that attrbutes
+    retrived from this new object will undergo the expected transfomrmations while
+    preserving the original data.
+
+    Attributes:
+        subset_obj: Subset[tuple[ImageType, np.float64]] Subset of the original
+                    dataset.
+        img_transform: v2.Compose | None  Transformation(s) to be applied to images.
+        label_transform: v2.Lambda | None Transformation(s) to be applied to labels.
+
+    """
+
+    def __init__(
+        self,
+        subset_obj: SubsetImageDepth,
+        img_transform: v2.Compose | None = None,
+        label_transform: v2.Lambda | None = None,
+    ) -> None:
+        """Initialize the wrapper with optional image and label transforms."""
+        # NOTE: v2 transformation classes != typical torch transformation classes
+        self.subset_obj: SubsetImageDepth = subset_obj
+        self.img_transform: v2.Compose | None = img_transform
+        self.label_transform: v2.Lambda | None = label_transform
+
+    @override
+    def __getitem__(self, idx: int) -> tuple[Any | ImageType, Any | np.float64]:
+        """Retrieve the image and label from the subest object."""
+        img, label = self.subset_obj[idx]  # Gets (PIL Image, raw_label)
+
+        if self.img_transform:
+            img = self.img_transform(img)
+        if self.label_transform:
+            label = self.label_transform(label)
+        return img, label
+
+    def __len__(self):
+        """Get number of entries in subset."""
+        return len(self.subset_obj)
+
+    @classmethod
+    def from_subset(
+        cls,
+        eval_subset: SubsetImageDepth,
+        train_subset: SubsetImageDepth,
+        crop_size: int,
+        final_label_transform: v2.Lambda,
+        model: ModelType,
+    ):
+        """Construct a tuple of transformed datasets from subsets."""
+        rgb_models = [ModelType.ENET, ModelType.RESNET, ModelType.VIT]
+
+        # TODO: using composition, wrap models in class that retrieves their transformations
+        # then easily grab transforms
+
+        # TODO: evaluate implementing extra transforms
+        extra_tf: list[nn.Module] = [
+            # crop random area
+            # flip image with some probability
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomVerticalFlip(p=0.5),
+        ]
+
+        common_tf: list[nn.Module] = [
+            # convert PIL to tensor
+            v2.PILToTensor(),
+            # ToTensor preserves original datatype, this ensures it is proper input type
+            v2.ToDtype(torch.uint8, scale=True),
+            v2.CenterCrop(size=crop_size),
+            # normalize across channels, expects float
+            v2.ToDtype(torch.float32, scale=True),
+        ]
+        if model in rgb_models:
+            logger.debug("Model type requires three input channels, appending extra transform.")
+            # convert to gray before normalization and keep 3 channels for some backbones
+            common_tf.extend(
+                [
+                    v2.Grayscale(num_output_channels=3),
+                    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ]
+            )
+        else:
+            logger.debug("Model type requires one input channel, appending grayscale transform.")
+            # custom nets (NEW, FOCUSNET) take a single-channel hologram
+            common_tf.append(v2.Grayscale(num_output_channels=1))
+
+        eval_transform: v2.Compose = v2.Compose(common_tf)
+        train_transform: v2.Compose = v2.Compose(extra_tf + common_tf)
+        logger.debug("Train and evaluation transformations composed successfully.")
+
+        # providing the dataset with these transforms will create a new subset
+        # dataset containing the transformed images
+        tf_eval_ds = cls(
+            subset_obj=eval_subset,
+            img_transform=eval_transform,
+            label_transform=final_label_transform,
+        )
+        tf_train_ds = cls(
+            subset_obj=train_subset,
+            img_transform=train_transform,
+            label_transform=final_label_transform,
+        )
+        logger.debug("transformed datasets created")
+        return (tf_train_ds, tf_eval_ds)

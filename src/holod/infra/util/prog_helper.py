@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from rich.progress import Task
 
-    from holod.infra.dataclasses import AutoConfig, CoreTrainer
+    from holod.infra.dataclasses import CoreTrainer
 
 # used to help align items that are printed, allows for one central area of control
 ALIGN: str = "\t  "
@@ -79,9 +79,11 @@ class PlainProgress:
     """Plain-text stand-in for ``rich.progress.Progress``.
 
     Rich live displays render nothing when stdout is neither a terminal nor a
-    notebook display hook — e.g. output piped to a file, or a ``!holod train``
-    shell cell in Jupyter/Colab. This implements the subset of the ``Progress``
-    API the training loop uses and prints throttled status lines instead.
+    notebook display hook (e.g. output piped to a file, or a ``!holod train``
+    cell in plain Jupyter), and under Colab's shell-cell PTY they print a new
+    frame per refresh instead of repainting. This implements the subset of the
+    ``Progress`` API the training loop uses and prints throttled status lines
+    instead.
     """
 
     def __init__(self, print_interval_s: float = _PRINT_INTERVAL_S) -> None:
@@ -209,10 +211,9 @@ def track_progress[T](
 
 
 def setup_training_progress(
-    a_cfg: AutoConfig,
+    core_trainer: CoreTrainer,
     train_loss: float,
     val_loss: float,
-    core_trainer: CoreTrainer,
     device_name: str,
 ) -> tuple[ProgressLike, TaskID, TaskID, TaskID]:
     """Create a progress reporter for training monitoring suited to the environment."""
@@ -228,7 +229,7 @@ def setup_training_progress(
     # progress
     epoch_task = progress_bar.add_task(
         "Epoch",
-        total=a_cfg.epoch_count,
+        total=core_trainer.a_cfg.epoch_count,
         train_loss=train_loss_start,
         val_loss=val_loss_start,
         accuracy_measure=0,
@@ -242,9 +243,9 @@ def setup_training_progress(
     )
 
     console.print(
-        f"{ALIGN}Using: [bold green]{a_cfg.device()}[/]",
+        f"{ALIGN}Using: [bold green]{core_trainer.device}[/]",
     )
-    if a_cfg.device() == "cuda":
+    if core_trainer.device == "cuda":
         console.print(
             f"{ALIGN}Cuda Device is: [bold green]{device_name}[/]",
         )

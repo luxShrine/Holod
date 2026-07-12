@@ -1,12 +1,15 @@
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 import numpy.typing as npt
 
 from holod.infra.log import get_logger, init_logging
 from holod.infra.util.paths import checkpoints_loc, data_spec, path_check, report_path
+
+if TYPE_CHECKING:
+    from holod.core.plots import PlotPred
 
 # Must be called before anything logs
 init_logging()
@@ -109,12 +112,8 @@ def train(
     use_sample_data: bool | None,
 ) -> None:
     """Train the autofocus model based on supplied dataset."""
-    from datetime import datetime
-
-    from serde.json import to_json
     from serde.toml import from_toml
 
-    from holod.core.plots import PlotPred
     from holod.infra.dataclasses import AutoConfig, Flags, Paths, Train, UserConfig
     from holod.infra.training import train_autofocus
 
@@ -164,13 +163,8 @@ def train(
         )
         autofocus_config = AutoConfig()
 
-    # plot_info = train_autofocus_lightning(autofocus_config, path_ckpt=None)
     plot_info: PlotPred = train_autofocus(autofocus_config, path_ckpt)
-    current_time = datetime.now()
-    current_time = current_time.strftime("%H%M%S")
-    with open(report_path() / "plot_info.json", "w", encoding="utf-8") as f:
-        plot_info_json = to_json(plot_info, PlotPred)
-        f.write(plot_info_json)
+    plot_info.save_to_file()
 
 
 @cli.command()
@@ -261,7 +255,7 @@ def compare(
 
     autofocus_config: AutoConfig
     if skip_train:
-        # static statistics need no dataset; build the config directly from CLI values
+        # NOTE: static statistics need no dataset; build the config directly from CLI values
         overrides: dict[str, Any] = {
             key: value
             for key, value in {
@@ -411,36 +405,42 @@ def plot_train(
     display: str,
 ):
     """Plot the data saved from autofocus training."""
-    from serde.json import from_json
-
     from holod.core.plots import PlotPred  # performance reasons, import locally in function
     from holod.infra.util.types import AnalysisType, DisplayType
 
     logger.info("plotting training data...")
+    jsons = list(report_path().glob("plot_info_*.json"))
 
-    with open(report_path() / "plot_info.json") as f:
-        plot_info: PlotPred = from_json(PlotPred, f.read())
+    for idx, path_to_json in enumerate(jsons):
+        # tie output filenames to the source json's backbone+timestamp token so runs
+        # (including several backbones saved by one `compare`) don't overwrite each other
+        time_in_title = path_to_json.stem.removeprefix("plot_info_") or str(idx)
 
-    assert isinstance(plot_info, PlotPred), f"plot_info is not PlotPred, found {type(plot_info)}"
-    # update plot obj with desired values
-    display_check = DisplayType(display)
-    logger.info(f"Plotting function with option: {display}")
+        try:
+            plot_info = PlotPred.load_from_file(path_to_json)
 
-    meta_list: list[dict[str, Any]] = []
-    # TODO: automatically get analysis type
-    if plot_info.analysis == AnalysisType.CLASS.value:
-        cls_res_cm = plot_info.plot_classification(display_check)
-        if cls_res_cm is not None:
-            meta_list = cls_res_cm
-    elif plot_info.analysis == AnalysisType.REG.value:
-        reg_plots = plot_info.plot_regression(display_check)
-        if reg_plots is not None:
-            meta_list = reg_plots
+            # update plot obj with desired values
+            display_check = DisplayType(display)
+            logger.debug(f"Plotting function with option: {display}")
 
-    if all(meta_list) is not None:
-        meta_dict = {"items": meta_list}
-        with open(report_path() / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta_dict, f, ensure_ascii=False, indent=2)
+            meta_list: list[dict[str, Any]] = []
+            # TODO: automatically get analysis type
+            if plot_info.analysis == AnalysisType.CLASS.value:
+                cls_res_cm = plot_info.plot_classification(display_check, time_in_title)
+                if cls_res_cm is not None:
+                    meta_list = cls_res_cm
+            elif plot_info.analysis == AnalysisType.REG.value:
+                reg_plots = plot_info.plot_regression(display_check, time_in_title)
+                if reg_plots is not None:
+                    meta_list = reg_plots
+        except Exception:
+            logger.exception(f"Failed to plot {path_to_json.name}, skipping.")
+            continue
+
+        if meta_list:
+            meta_dict = {"items": meta_list}
+            with open(report_path() / f"meta_{time_in_title}.json", "w", encoding="utf-8") as f:
+                json.dump(meta_dict, f, ensure_ascii=False, indent=2)
 
 
 @cli.command()

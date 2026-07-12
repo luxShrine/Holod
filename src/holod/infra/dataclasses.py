@@ -5,23 +5,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, override
 
 import click
-import numpy as np
 import numpy.typing as npt
+import timm
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from PIL.Image import Image as ImageType
 from serde import Untagged, serde
-from timm import create_model
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import models
 from torchvision.transforms import v2
 
 import holod.infra.util.paths as paths
-from holod.infra.dataset import HologramFocusDataset
+from holod.infra.dataset import HologramFocusDataset, RegLabelTransform, TransformedDataset
 from holod.infra.log import get_logger
+from holod.infra.models import FocusNetTorch, NeuralNetwork
 from holod.infra.util.types import (
     Q_,
     AnalysisType,
@@ -29,14 +27,15 @@ from holod.infra.util.types import (
     Mean,
     ModelType,
     StandardDev,
-    SubsetImageDepth,
     SubsetList,
     UserDevice,
     u,
 )
 
 if TYPE_CHECKING:
+    import numpy as np
     import numpy.typing as npt
+    from PIL.Image import Image as ImageType
     from pint.facets.plain.quantity import PlainQuantity
     from torch.nn import Module
     from torch.optim import Optimizer
@@ -192,37 +191,6 @@ class AutoConfig:
         logger.debug(f"Using device: {actual_device}")
         return actual_device
 
-    def create_model(self) -> nn.Module:
-        """Create and configure the model."""
-        model: nn.Module
-        num_model_outputs = 1 if self.analysis == AnalysisType.REG else self.num_classes
-        match self.backbone:
-            case ModelType.NEW:
-                model = NeuralNetwork(1, num_classes=num_model_outputs)
-            case ModelType.ENET:
-                model = models.efficientnet_b4(weights=models.EfficientNet_B4_Weights.IMAGENET1K_V1)
-                in_features = model.classifier[1].in_features
-                model.classifier[1] = nn.Linear(in_features, num_model_outputs)
-            case ModelType.RESNET:
-                model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-                in_features = model.fc.in_features
-                model.fc = nn.Linear(in_features, num_model_outputs)
-            case ModelType.VIT:
-                model = create_model(
-                    "vit_base_patch16_224.augreg2_in21k_ft_in1k",
-                    pretrained=True,
-                    num_classes=num_model_outputs,
-                )
-            case ModelType.FOCUSNET:
-                model = FocusNetTorch(num_classes=num_model_outputs)
-            case _:
-                raise Exception(f"Could not create model specified: {self.backbone}")  # pyright: ignore[reportUnreachable]
-        logger.info(
-            f"Model '{self.backbone.value}' configured with {num_model_outputs} output "
-            + f"features for {self.analysis.value} analysis."
-        )
-        return model
-
     def to_user_config(self) -> UserConfig:
         """Convert from autoconfig to UserConfig."""
         paths = Paths(
@@ -285,7 +253,7 @@ class AutoConfig:
         elif "res" in backbone:
             backbone_type = ModelType.RESNET
         elif "new" in backbone or "custom" in backbone:
-            backbone_type = ModelType.NEW
+            backbone_type = ModelType.PCNN
         elif "focus" in backbone:
             backbone_type = ModelType.FOCUSNET
         else:
@@ -353,35 +321,6 @@ class AutoConfig:
             sch_factor=sch_factor,
             sch_patience=sch_patience,
         )
-
-
-class NeuralNetwork(nn.Module):
-    def __init__(self, in_channels, num_classes=10):
-        # TODO: write out the matrix size for each step <luxShrine>
-        super().__init__()
-        # conv2d (ks=3, s=1) -> (N, OC, h - 2, w - 2)
-        self.conv1 = nn.Conv2d(in_channels, 32, 3, 1)
-        self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.pool = nn.MaxPool2d(2)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
-
-        # avg pool to 1x1, allowing for size agnostic images passed in
-        self.gap = nn.AdaptiveAvgPool2d((1, 1))  # Any -> (1, 1)
-        self.fc1 = nn.Linear(64, 128)
-        self.fc2 = nn.Linear(128, num_classes)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))  # -> (N, 32, h-2, w-2)
-        x = F.relu(self.conv2(x))  # -> (N, 64, h-4, w-4)
-        x = self.pool(x)  # -> (N, 64, (h-4)/2, (h-4)/2)
-        x = self.dropout1(x)
-        x = self.gap(x)  # -> (N, 64, 1, 1)
-        x = torch.flatten(x, 1)  #  -> (N, 64 * 1 * 1)
-        x = F.relu(self.fc1(x))  # -> (N, 128)
-        x = self.dropout2(x)
-        x = self.fc2(x)  # -> (N, num_classes)
-        return F.log_softmax(x, dim=1)
 
 
 @serde
@@ -469,8 +408,9 @@ class UserConfig:
 
 @dataclass
 class CoreTrainer:
-    """Class to hold specifically all the training information."""
+    """Class to hold all the training information."""
 
+    a_cfg: AutoConfig
     evaluation_metric: npt.NDArray[np.float64] | npt.NDArray[np.intp]
     bin_centers: npt.NDArray[np.float64] | None
     model: Module
@@ -483,6 +423,18 @@ class CoreTrainer:
     val_loader: DataLoader[tuple[ImageType, np.float64]]
     z_std: PlainQuantity[float]
     z_avg: PlainQuantity[float]
+
+    @property
+    def device(self):
+        return self.a_cfg.device()
+
+    @property
+    def analysis(self):
+        return self.a_cfg.analysis
+
+    @property
+    def backbone(self):
+        return self.a_cfg.backbone
 
     def get_std_avg(self, analysis: AnalysisType) -> tuple[Mean, StandardDev] | tuple[None, None]:
         """Return the standard deviation and average if necessitated by analysis."""
@@ -505,6 +457,38 @@ class CoreTrainer:
                 raise e
         else:
             raise Exception("z_avg, and z_std need to be used but are None.")
+
+    def check_loss(self, labels_tens: Tensor, pred: Tensor):
+        # TODO: this check is done every time, probably should set this once as an operation
+        # to perform and reuse it
+        if self.backbone == ModelType.PCNN:
+            labels_tens = labels_tens.float()
+        elif isinstance(self.loss_fn, nn.MSELoss):
+            labels_tens = labels_tens.float()  # expects float
+        elif isinstance(self.loss_fn, nn.BCEWithLogitsLoss):
+            labels_tens = labels_tens.float()  # BCE expects float 0/1
+        elif isinstance(self.loss_fn, nn.CrossEntropyLoss):
+            labels_tens = labels_tens.long()
+            # fail fast with a readable error; a mismatch here otherwise surfaces as an
+            # opaque CUDA device-side assert in backward()
+            num_classes = self.a_cfg.num_classes
+            if pred.ndim != 2 or pred.shape[1] != num_classes:
+                raise ValueError(
+                    f"Model '{self.backbone.value}' output shape {tuple(pred.shape)} is "
+                    f"incompatible with CrossEntropyLoss over {num_classes} classes; "
+                    "expected (batch, num_classes)."
+                )
+            if labels_tens.numel() > 0 and (
+                int(labels_tens.min()) < 0 or int(labels_tens.max()) >= num_classes
+            ):
+                raise ValueError(
+                    f"Class labels outside [0, {num_classes}): "
+                    f"min {int(labels_tens.min())}, max {int(labels_tens.max())}."
+                )
+        else:
+            raise Exception(f"Loss function is unknown: {self.loss_fn}")
+
+        return labels_tens
 
 
 @dataclass
@@ -556,144 +540,34 @@ class TrainingRepeatConfig:
     avg_val_loss: float
 
 
-# ---------- focusnet torch implementation ----------
-
-
-@torch.no_grad()
-def fft_mag2d(x: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
-    """Compute |FFT2| with centered spectrum, per-sample, per-channel.
-
-    Args:
-        x: (N, C, H, W) real input (hologram).
-        eps: small bias for numerical stability.
-
-    Returns:
-        (N, C, H, W) nonnegative magnitude.
-
-    """
-    # FFT expects complex; cast real -> complex
-    x_c = torch.view_as_complex(torch.stack((x, torch.zeros_like(x)), dim=-1))
-    f = torch.fft.fft2(x_c, dim=(-2, -1), norm="backward")
-    f = torch.fft.fftshift(f, dim=(-2, -1))
-    mag = torch.abs(f)
-    if eps:
-        mag = mag + eps
-    return mag.real  # still real
-
-
-def make_input_2ch(holod: torch.Tensor, use_fft: bool = True) -> torch.Tensor:
-    """Build the 2‑channel input described in the repo's Fourier2D layer.
-
-    Args:
-        holod: (N, 1, H, W) real hologram.
-
-    """
-    assert holod.ndim == 4 and holod.size(1) == 1, "expect (N,1,H,W)"
-    if use_fft:
-        mag = fft_mag2d(holod)
-        x = torch.cat([holod, mag], dim=1)  # -> (N, 2, H, W)
-    else:
-        x = torch.cat([holod, holod], dim=1)
-    return x
-
-
-# ---------- Model ----------
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, c_in: int, c_out: int, k: int = 3, s: int = 1, p: int | None = None):
-        super().__init__()
-        p = (k // 2) if p is None else p
-        self.conv = nn.Conv2d(c_in, c_out, k, s, p, bias=False)
-        self.bn = nn.BatchNorm2d(c_out)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x)))
-
-
-class FocusNetTorch(nn.Module):
-    """Compact CNN for DLHM depth, inspired by the TF/Keras FocusNET repo.
-
-    - Input: (N, 1, H, W) hologram; expanded to 2 channels [holod, |FFT(holod)|] internally.
-    - Output: (N, num_classes) logits for classification, or (N, 1) normalized depth
-      for regression (num_classes=1), matching the other backbones.
-    """
-
-    def __init__(
-        self,
-        num_classes: int = 1,
-        width: int = 32,
-        use_fft: bool = True,
-        head: Literal["mlp", "linear"] = "mlp",
-        dropout: float = 0.2,
-    ) -> None:
-        super().__init__()
-        self.use_fft = use_fft
-
-        # Feature extractor; stem sees the 2-channel input built in forward()
-        self.stem = ConvBlock(2, width, k=3)
-        self.layer1 = nn.Sequential(
-            ConvBlock(width, width, k=3),
-            ConvBlock(width, width, k=3),
-        )
-        self.down1 = ConvBlock(width, width * 2, k=3, s=2)  # 128x128
-        self.layer2 = nn.Sequential(
-            ConvBlock(width * 2, width * 2, k=3),
-            ConvBlock(width * 2, width * 2, k=3),
-        )
-        self.down2 = ConvBlock(width * 2, width * 4, k=3, s=2)  # 64x64
-        self.layer3 = nn.Sequential(
-            ConvBlock(width * 4, width * 4, k=3),
-            ConvBlock(width * 4, width * 4, k=3),
-        )
-
-        # Global pooling + head
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        emb_dim = width * 4
-        if head == "mlp":
-            self.head = nn.Sequential(
-                nn.Flatten(),
-                nn.Dropout(dropout),
-                nn.Linear(emb_dim, emb_dim // 2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
-                nn.Linear(emb_dim // 2, num_classes),
+def create_autofocus_model(a_cfg: AutoConfig) -> nn.Module:
+    """Create and configure the model."""
+    model: nn.Module
+    num_model_outputs = 1 if a_cfg.analysis == AnalysisType.REG else a_cfg.num_classes
+    match a_cfg.backbone:
+        case ModelType.PCNN:
+            model = NeuralNetwork(1, num_model_outputs)
+        case ModelType.ENET:
+            model = models.efficientnet_b4(weights=models.EfficientNet_B4_Weights.IMAGENET1K_V1)
+            in_features = model.classifier[1].in_features
+            model.classifier[1] = nn.Linear(in_features, num_model_outputs)  # pyright: ignore[reportArgumentType]
+        case ModelType.RESNET:
+            model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            in_features = model.fc.in_features
+            model.fc = nn.Linear(in_features, num_model_outputs)
+        case ModelType.VIT:
+            model = timm.create_model(
+                "vit_base_patch16_224.augreg2_in21k_ft_in1k",
+                pretrained=True,
+                num_classes=num_model_outputs,
             )
-        else:
-            self.head = nn.Sequential(nn.Flatten(), nn.Linear(emb_dim, num_classes))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the network on a (N, 1, H, W) real hologram.
-
-        Returns:
-            (N, num_classes) raw logits (classification) or values (regression).
-
-        """
-        x = make_input_2ch(x, use_fft=self.use_fft)
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.down1(x)
-        x = self.layer2(x)
-        x = self.down2(x)
-        x = self.layer3(x)
-        x = self.pool(x)
-        return self.head(x)
-
-
-# Label transforms must be picklable so DataLoader workers (spawn on Windows)
-# can serialize the dataset; locals/lambdas inside transform_ds break that.
-@dataclass
-class RegLabelTransform:
-    """Normalize a physical z-value into a float tensor using training-set stats."""
-
-    z_avg: float
-    z_std: float
-
-    def __call__(self, z_raw: np.float32) -> Tensor:
-        """Pass in physical value, return normalized z tensor."""
-        z_tensor = torch.as_tensor(z_raw, dtype=torch.float32)
-        return (z_tensor - self.z_avg) / self.z_std
+        case ModelType.FOCUSNET:
+            model = FocusNetTorch(num_classes=num_model_outputs)
+    logger.info(
+        f"Model '{a_cfg.backbone.value}' configured with {num_model_outputs} output "
+        + f"features for {a_cfg.analysis.value} analysis."
+    )
+    return model
 
 
 def class_label_transform(z_raw_idx: np.int64) -> Tensor:
@@ -701,116 +575,7 @@ def class_label_transform(z_raw_idx: np.int64) -> Tensor:
     return torch.as_tensor(z_raw_idx, dtype=torch.long)
 
 
-class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
-    """Transform the input dataset by applying transfomations to it's contents.
-
-    By wrapping the underlying dataset in this class, we can ensure that attrbutes
-    retrived from this new object will undergo the expected transfomrmations while
-    preserving the original data.
-
-    Attributes:
-        subset_obj: Subset[tuple[ImageType, np.float64]] Subset of the original
-                    dataset.
-        img_transform: v2.Compose | None  Transformation(s) to be applied to images.
-        label_transform: v2.Lambda | None Transformation(s) to be applied to labels.
-
-    """
-
-    def __init__(
-        self,
-        subset_obj: SubsetImageDepth,
-        img_transform: v2.Compose | None = None,
-        label_transform: v2.Lambda | None = None,
-    ) -> None:
-        """Initialize the wrapper with optional image and label transforms."""
-        # NOTE: v2 transformation classes != typical torch transformation classes
-        self.subset_obj: SubsetImageDepth = subset_obj
-        self.img_transform: v2.Compose | None = img_transform
-        self.label_transform: v2.Lambda | None = label_transform
-
-    @override
-    def __getitem__(self, idx: int) -> tuple[Any | ImageType, Any | np.float64]:
-        """Retrieve the image and label from the subest object."""
-        img, label = self.subset_obj[idx]  # Gets (PIL Image, raw_label)
-
-        if self.img_transform:
-            img = self.img_transform(img)
-        if self.label_transform:
-            label = self.label_transform(label)
-        return img, label
-
-    def __len__(self):
-        """Get number of entries in subset."""
-        return len(self.subset_obj)
-
-    @classmethod
-    def from_subset(
-        cls,
-        eval_subset: SubsetImageDepth,
-        train_subset: SubsetImageDepth,
-        crop_size: int,
-        final_label_transform: v2.Lambda,
-        model: ModelType,
-    ):
-        """Construct a tuple of transformed datasets from subsets."""
-        rgb_models = [ModelType.ENET, ModelType.RESNET, ModelType.VIT]
-
-        # TODO: using composition, wrap models in class that retrieves their transformations
-        # then easily grab transforms
-
-        # TODO: evaluate implementing extra transforms
-        extra_tf: list[nn.Module] = [
-            # crop random area
-            v2.RandomResizedCrop(size=crop_size, antialias=True),
-            # flip image with some probability
-            v2.RandomHorizontalFlip(p=0.5),
-            v2.RandomVerticalFlip(p=0.5),
-        ]
-
-        common_tf: list[nn.Module] = [
-            # convert PIL to tensor
-            v2.PILToTensor(),
-            # ToTensor preserves original datatype, this ensures it is proper input type
-            v2.ToDtype(torch.uint8, scale=True),
-            v2.CenterCrop(size=crop_size),
-            # normalize across channels, expects float
-            v2.ToDtype(torch.float32, scale=True),
-        ]
-        if model in rgb_models:
-            logger.debug("Model type requires three input channels, appending extra transform.")
-            # convert to gray before normalization and keep 3 channels for some backbones
-            common_tf.extend(
-                [
-                    v2.Grayscale(num_output_channels=3),
-                    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ]
-            )
-        else:
-            logger.debug("Model type requires one input channel, appending grayscale transform.")
-            # custom nets (NEW, FOCUSNET) take a single-channel hologram
-            common_tf.append(v2.Grayscale(num_output_channels=1))
-
-        eval_transform: v2.Compose = v2.Compose(common_tf)
-        train_transform: v2.Compose = v2.Compose(extra_tf + common_tf)
-        logger.debug("Train and evaluation transformations composed successfully.")
-
-        # providing the dataset with these transforms will create a new subset
-        # dataset containing the transformed images
-        tf_eval_ds = cls(
-            subset_obj=eval_subset,
-            img_transform=eval_transform,
-            label_transform=final_label_transform,
-        )
-        tf_train_ds = cls(
-            subset_obj=train_subset,
-            img_transform=train_transform,
-            label_transform=final_label_transform,
-        )
-        logger.debug("transformed datasets created")
-        return (tf_train_ds, tf_eval_ds)
-
-
-def transform_ds(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
+def create_training_setup(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
     """Split the dataset, apply transforms and build dataloaders."""
     (train_subset, eval_subset) = a_cfg.setup_loader_indices(base)
     logger.debug("Train and evaluation subset created successfully")
@@ -864,7 +629,7 @@ def transform_ds(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
 
     # reg options: nn.BCEWithLogitsLoss(), nn.MSELoss()
     loss_fn = nn.CrossEntropyLoss() if a_cfg.analysis == AnalysisType.CLASS else nn.MSELoss()
-    model = a_cfg.create_model()
+    model = create_autofocus_model(a_cfg)
 
     # optimizer should only be created after model
     optimizer = torch.optim.AdamW(
@@ -881,6 +646,7 @@ def transform_ds(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
 
     # Create CoreTrainer
     core_trainer_config = CoreTrainer(
+        a_cfg=a_cfg,
         evaluation_metric=evaluation_metric,  # This is Arr64 of z_m or bin_centers_m
         bin_centers=base.bin_centers if a_cfg.analysis == AnalysisType.CLASS else None,
         model=model,
