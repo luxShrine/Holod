@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, NewType, TypeVar
 import numpy as np
 import numpy.typing as npt
 import pint
+import torch
 from PIL.Image import Image as ImageType
 from torch.utils.data import Subset
 
@@ -44,6 +45,7 @@ type Arr32 = npt.NDArray[np.float32]
 # -- Epoch Helper --------------------------------------------------------------------------------
 type SubsetImageDepth = Subset[tuple[ImageType, np.float64 | int]]
 type SubsetList = list[Subset[tuple[ImageType, np.float64 | int]]]
+type StateDict = dict[str, Any]
 
 StandardDev = NewType("StandardDev", float)
 Mean = NewType("Mean", float)
@@ -62,6 +64,12 @@ class AnalysisType(Enum):
 
     CLASS = "class"
     REG = "reg"
+
+    @staticmethod
+    def determine(num_classes: int):
+        if num_classes == 1:
+            return AnalysisType.REG
+        return AnalysisType.CLASS
 
 
 class DisplayType(Enum):
@@ -88,6 +96,16 @@ class UserDevice(Enum):
     CPU = "cpu"
     CUDA = "cuda"
 
+    @staticmethod
+    def determine(desired_device: str = "cuda"):
+        if desired_device == "cpu":
+            device = UserDevice.CPU
+        elif desired_device == "cuda":
+            device = UserDevice.CUDA if torch.cuda.is_available() else UserDevice.CPU
+        else:
+            device = UserDevice.CPU
+        return device
+
 
 class ModelType(Enum):
     """Restrict model backbone to known models.
@@ -104,6 +122,21 @@ class ModelType(Enum):
     RESNET = "resnet50"
     PCNN = "new"
     FOCUSNET = "focusnet"
+
+    @classmethod
+    def from_str(cls, backbone: str):
+        backbone = backbone.lower()
+        if "vit" in backbone:
+            return ModelType.VIT
+        if "enet" in backbone or "efficient" in backbone:
+            return ModelType.ENET
+        if "res" in backbone:
+            return ModelType.RESNET
+        if "new" in backbone or "custom" in backbone or "pcnn" in backbone:
+            return ModelType.PCNN
+        if "focus" in backbone:
+            return ModelType.FOCUSNET
+        raise Exception(f"Unknown backbone passed: {backbone}")
 
 
 class TrainingStage(IntEnum):

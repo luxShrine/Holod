@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
 # WARN: Path must be importable at runtime: pyserde wraps @serde class methods with
@@ -20,13 +20,17 @@ from torchvision.transforms import v2
 
 from holod.core.optics.reconstruction import dlhm_effective_z_mm, focus_score
 from holod.core.plots import PlotPred
-from holod.infra.dataclasses import AutoConfig, create_autofocus_model
+from holod.infra.dataclasses import (
+    AutoConfig,
+    Checkpoint,
+    CompareUserConfig,
+    ModelCheckpoint,
+    create_autofocus_model,
+)
 from holod.infra.dataset import HologramFocusDataset
 from holod.infra.log import console_ as console
 from holod.infra.log import get_logger
 from holod.infra.training import (
-    Checkpoint,
-    ModelCheckpoint,
     create_training_setup,
     train_eval_epoch,
 )
@@ -37,6 +41,7 @@ from holod.infra.util.types import (
     AnalysisType,
     DisplayType,
     ModelType,
+    UserDevice,
 )
 
 if TYPE_CHECKING:
@@ -102,7 +107,6 @@ class ComparisonReport:
     batch_size: int
     epoch_count: int
     device: str
-    trained: bool
     created: str
     stats: list[BackboneStats] = field(default_factory=list)
 
@@ -135,15 +139,14 @@ class ComparisonReport:
         table.add_column("Pretrained", justify="center")
         table.add_column("ms/img", justify="right")
         table.add_column("img/s", justify="right")
-        if self.trained:
-            table.add_column("Train time (s)", justify="right")
-            table.add_column("s/epoch", justify="right")
-            table.add_column("Train loss", justify="right")
-            table.add_column("Val loss", justify="right")
-            table.add_column(metric_header, justify="right")
-            if self.analysis == AnalysisType.CLASS.value:
-                # accuracy misses how far off wrong bins are; MAE in mm shows that
-                table.add_column("Val MAE (mm)", justify="right")
+        table.add_column("Train time (s)", justify="right")
+        table.add_column("s/epoch", justify="right")
+        table.add_column("Train loss", justify="right")
+        table.add_column("Val loss", justify="right")
+        table.add_column(metric_header, justify="right")
+        if self.analysis == AnalysisType.CLASS.value:
+            # accuracy misses how far off wrong bins are; MAE in mm shows that
+            table.add_column("Val MAE (mm)", justify="right")
         table.add_column("Error")
 
         best = self.best_index()
@@ -158,18 +161,17 @@ class ComparisonReport:
                 _fmt(s.latency_ms_per_img, ".2f"),
                 _fmt(s.throughput_img_per_s, ".1f"),
             ]
-            if self.trained:
-                row.extend(
-                    [
-                        _fmt(s.train_time_s, ".1f"),
-                        _fmt(s.time_per_epoch_s, ".1f"),
-                        _fmt(s.avg_train_loss, ".4g"),
-                        _fmt(s.avg_val_loss, ".4g"),
-                        _fmt(s.best_val_metric, ".4g"),
-                    ]
-                )
-                if self.analysis == AnalysisType.CLASS.value:
-                    row.append(_fmt(s.val_mae_mm, ".4g"))
+            row.extend(
+                [
+                    _fmt(s.train_time_s, ".1f"),
+                    _fmt(s.time_per_epoch_s, ".1f"),
+                    _fmt(s.avg_train_loss, ".4g"),
+                    _fmt(s.avg_val_loss, ".4g"),
+                    _fmt(s.best_val_metric, ".4g"),
+                ]
+            )
+            if self.analysis == AnalysisType.CLASS.value:
+                row.append(_fmt(s.val_mae_mm, ".4g"))
             row.append(s.error if s.error is not None else "")
             table.add_row(*row, style="bold green" if i == best else None)
         return table
@@ -204,36 +206,32 @@ class ComparisonReport:
 
         # one panel per statistic: (subplot title, per-backbone values, format spec)
         panels: list[tuple[str, list[float | None], str]]
-        if self.trained:
-            metric_title = (
-                "Accuracy (higher is better)"
-                if self.analysis == AnalysisType.CLASS.value
-                else "Val MAE (mm, lower is better)"
-            )
-            panels = [
-                (metric_title, [s.best_val_metric for (_i, s) in plotted], ".4g"),
+        metric_title = (
+            "Accuracy (higher is better)"
+            if self.analysis == AnalysisType.CLASS.value
+            else "Val MAE (mm, lower is better)"
+        )
+        panels = [
+            ("Parameters (M)", [s.total_params / 1e6 for (_i, s) in plotted], ".2f"),
+            ("Latency (ms/img)", [s.latency_ms_per_img for (_i, s) in plotted], ".2f"),
+            ("Model size (MB)", [s.model_size_mb for (_i, s) in plotted], ".1f"),
+            (metric_title, [s.best_val_metric for (_i, s) in plotted], ".4g"),
+            (
+                "Validation loss (lower is better)",
+                [s.avg_val_loss for (_i, s) in plotted],
+                ".4g",
+            ),
+            ("Time per epoch (s)", [s.time_per_epoch_s for (_i, s) in plotted], ".1f"),
+        ]
+        if any(s.val_mae_mm is not None for (_i, s) in plotted):
+            panels.insert(
+                1,
                 (
-                    "Validation loss (lower is better)",
-                    [s.avg_val_loss for (_i, s) in plotted],
+                    "Val MAE (mm, lower is better)",
+                    [s.val_mae_mm for (_i, s) in plotted],
                     ".4g",
                 ),
-                ("Time per epoch (s)", [s.time_per_epoch_s for (_i, s) in plotted], ".1f"),
-            ]
-            if any(s.val_mae_mm is not None for (_i, s) in plotted):
-                panels.insert(
-                    1,
-                    (
-                        "Val MAE (mm, lower is better)",
-                        [s.val_mae_mm for (_i, s) in plotted],
-                        ".4g",
-                    ),
-                )
-        else:
-            panels = [
-                ("Parameters (M)", [s.total_params / 1e6 for (_i, s) in plotted], ".2f"),
-                ("Latency (ms/img)", [s.latency_ms_per_img for (_i, s) in plotted], ".2f"),
-                ("Model size (MB)", [s.model_size_mb for (_i, s) in plotted], ".1f"),
-            ]
+            )
 
         fig = make_subplots(
             rows=1,
@@ -259,7 +257,7 @@ class ComparisonReport:
                 row=1,
                 col=col,
             )
-        stats_kind = "training statistics" if self.trained else "architecture statistics"
+        stats_kind = "training statistics"
         _ = fig.update_layout(
             title_text=f"Backbone {stats_kind}   {self.analysis}, {self.device}, "
             + f"crop {self.crop_size}",
@@ -398,17 +396,16 @@ def _fill_training_stats(
 
 
 def compare_backbones(
-    a_cfg: AutoConfig,
+    u_cfg: CompareUserConfig,
     backbones: list[ModelType] | None = None,
-    run_training: bool = True,
 ) -> ComparisonReport:
-    """Compare backbones under one shared config, optionally training each one.
+    """Compare backbones under one shared config, training each with its own model config.
 
     Args:
-        a_cfg: Shared runtime configuration; its ``backbone`` field is replaced per run.
-        backbones: Which backbones to compare; ``None`` compares every ``ModelType``.
-        run_training: When ``False``, only architecture and inference statistics are
-            collected   no dataset is loaded and no training happens.
+        u_cfg: Shared configuration plus the per-model sections; its paths must be
+            resolved (``resolve_paths``) before calling.
+        backbones: Which backbones to compare; ``None`` compares every backbone
+            configured in ``u_cfg``.
 
     Returns:
         A ``ComparisonReport`` with one ``BackboneStats`` entry per requested backbone.
@@ -416,43 +413,36 @@ def compare_backbones(
         the remaining runs.
 
     """
-    chosen = list(ModelType) if backbones is None else list(backbones)
-    base: HologramFocusDataset | None = None
-    if run_training:
-        base = HologramFocusDataset(
-            mode=a_cfg.analysis,
-            num_classes=a_cfg.num_classes,
-            csv_file_strpath=a_cfg.meta_csv_strpath,
-        )
+    _ = u_cfg.resolve_paths()  # no-op when the CLI already resolved
+    chosen = u_cfg.configured_backbones() if backbones is None else list(backbones)
+    device = UserDevice.determine(u_cfg.device)
+    analysis = AnalysisType.determine(u_cfg.num_classes)
+    base = HologramFocusDataset(
+        mode=analysis,
+        num_classes=u_cfg.num_classes,
+        csv_file_strpath=u_cfg.paths.meta_csv_name,
+    )
 
     stats: list[BackboneStats] = []
     for backbone in chosen:
         console.rule(f"[black on cyan] Comparing backbone: {backbone.value} ")
-        cfg = replace(
-            a_cfg,
-            backbone=backbone,
-            crop_size=resolve_crop_size(backbone, a_cfg.crop_size),
-            data={},
-            optimizer={},
-        )
+        cfg = u_cfg.to_auto_config(backbone)
         entry = BackboneStats(backbone=backbone.value, metric_name=_metric_name(cfg.analysis))
         try:
             entry = collect_model_stats(cfg)
-            if base is not None:
-                _fill_training_stats(entry, cfg, base)
+            _fill_training_stats(entry, cfg, base)
         except Exception as exc:
             entry.error = f"{type(exc).__name__}: {exc}"
             logger.exception(f"Comparison failed for backbone '{backbone.value}'.")
         stats.append(entry)
 
     return ComparisonReport(
-        analysis=a_cfg.analysis.value,
-        num_classes=a_cfg.num_classes,
-        crop_size=a_cfg.crop_size,
-        batch_size=a_cfg.batch_size,
-        epoch_count=a_cfg.epoch_count if run_training else 0,
-        device=a_cfg.device(),
-        trained=run_training,
+        analysis=analysis.value,
+        num_classes=u_cfg.num_classes,
+        crop_size=u_cfg.crop_size,
+        batch_size=u_cfg.batch_size,
+        epoch_count=u_cfg.epoch_count,
+        device=device.value,
         created=datetime.now().isoformat(timespec="seconds"),
         stats=stats,
     )
@@ -677,7 +667,7 @@ def _load_checkpoint_model(
         torch_dict: dict[str, Any] = torch.load(ckpt_path, weights_only=True, map_location=device)
     # best-model .pth files hold a flat Checkpoint dict; latest_checkpoint.tar nests it
     ckpt = Checkpoint.from_dict(torch_dict.get("checkpoint", torch_dict))
-    a_cfg = AutoConfig(
+    a_cfg = AutoConfig.default(
         analysis=AnalysisType.REG if ckpt.bin_centers is None else AnalysisType.CLASS,
         backbone=ckpt.model_type,
         num_classes=ckpt.num_classes,

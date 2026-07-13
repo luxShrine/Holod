@@ -171,6 +171,68 @@ def test_evaluation_metric_class():
     )
 
 
+def test_soft_ordinal_cross_entropy():
+    """Soft ordinal CE must respect bin ordering: near misses cost less than far ones."""
+    from holod.infra.losses import SoftOrdinalCrossEntropy
+
+    num_classes = 10
+    loss_fn = SoftOrdinalCrossEntropy(num_classes=num_classes, sigma=1.0)
+
+    # each row is a probability distribution peaked at the true bin
+    soft = loss_fn.soft_targets
+    assert soft.shape == (num_classes, num_classes)
+    assert torch.allclose(soft.sum(dim=1), torch.ones(num_classes))
+    assert (soft.argmax(dim=1) == torch.arange(num_classes)).all()
+
+    # confident predictions closer to the true bin must yield a lower loss
+    true_bin = torch.tensor([4])
+    logits_near = torch.full((1, num_classes), -10.0)
+    logits_near[0, 5] = 10.0  # one bin away
+    logits_far = torch.full((1, num_classes), -10.0)
+    logits_far[0, 9] = 10.0  # five bins away
+    assert loss_fn(logits_near, true_bin) < loss_fn(logits_far, true_bin)
+
+    # gradients must flow through the logits for training to work
+    logits = torch.zeros(2, num_classes, requires_grad=True)
+    loss = loss_fn(logits, torch.tensor([0, 7]))
+    loss.backward()
+    assert logits.grad is not None
+
+    # invalid parameters fail loudly
+    import pytest
+
+    with pytest.raises(ValueError):
+        _ = SoftOrdinalCrossEntropy(num_classes=num_classes, sigma=0.0)
+    with pytest.raises(ValueError):
+        _ = SoftOrdinalCrossEntropy(num_classes=1, sigma=1.0)
+
+
+def test_soft_label_loss_selection():
+    """create_training_setup must pick the soft ordinal loss only when sigma > 0."""
+    from torch import nn
+
+    from holod.infra.losses import SoftOrdinalCrossEntropy
+
+    hard_cfg = AutoConfig(num_workers=0, num_classes=10, analysis=AnalysisType.CLASS)
+    soft_cfg = AutoConfig(
+        num_workers=0, num_classes=10, analysis=AnalysisType.CLASS, soft_label_sigma=1.5
+    )
+    reg_cfg = AutoConfig(num_workers=0, analysis=AnalysisType.REG, soft_label_sigma=1.5)
+
+    hard_trainer = create_training_setup(create_test_dataset(), hard_cfg)
+    assert isinstance(hard_trainer.loss_fn, nn.CrossEntropyLoss)
+    trainer_soft = create_training_setup(create_test_dataset(), soft_cfg)
+    assert isinstance(trainer_soft.loss_fn, SoftOrdinalCrossEntropy)
+    # regression is untouched by the sigma setting
+    assert isinstance(create_training_setup(create_test_dataset(), reg_cfg).loss_fn, nn.MSELoss)
+
+    # check_loss must keep hard indices flowing (long dtype) for the soft loss
+    labels = torch.tensor([0.0, 1.0, 2.0])
+    pred = torch.zeros(3, trainer_soft.a_cfg.num_classes)
+    checked = trainer_soft.check_loss(labels, pred)
+    assert checked.dtype == torch.long
+
+
 def test_model_creation():
     # ModelType.NEW is mid-migration and not constructible yet, so it is
     # not covered here
@@ -219,22 +281,58 @@ def test_backbone_static_stats():
     assert entry.throughput_img_per_s is not None and entry.throughput_img_per_s > 0
 
 
-def test_compare_backbones_static():
-    """Compare custom backbones without training; report must render and serialize."""
-    from serde.json import to_json
+def test_compare_config_mapping():
+    """Per-model TOML sections must map onto the selected backbone's AutoConfig."""
+    import pytest
 
-    from holod.core.compare import ComparisonReport, compare_backbones
+    from holod.infra.dataclasses import CompareUserConfig, Flags, ModelConfig, Paths, Train
 
-    cfg = AutoConfig(
+    cfg = CompareUserConfig(
+        paths=Paths.empty(),
+        flags=Flags.empty(),
         num_classes=5,
         crop_size=64,
-        device_user=UserDevice.CPU,
+        device="cpu",
         num_workers=0,
+        soft_label_sigma=0.5,
+        focusnet=ModelConfig(Train("focusnet", 1e-3, 1e-2, 0.2, 3)),
     )
-    # ModelType.NEW (AttnModel) is mid-migration and not constructible yet, so compare
-    # only the working custom backbone
-    report = compare_backbones(cfg, backbones=[ModelType.FOCUSNET], run_training=False)
-    assert report.trained is False
+    assert cfg.configured_backbones() == [ModelType.FOCUSNET]
+
+    a_cfg = cfg.to_auto_config(ModelType.FOCUSNET)
+    assert a_cfg.backbone == ModelType.FOCUSNET
+    assert a_cfg.num_classes == 5
+    assert a_cfg.crop_size == 64
+    assert a_cfg.device_user == UserDevice.CPU
+    assert a_cfg.opt_lr == 1e-3
+    assert a_cfg.opt_weight_decay == 1e-2
+    assert a_cfg.sch_factor == 0.2
+    assert a_cfg.sch_patience == 3
+    assert a_cfg.soft_label_sigma == 0.5
+
+    # an unconfigured backbone must fail loudly instead of training with defaults
+    with pytest.raises(KeyError):
+        _ = cfg.to_auto_config(ModelType.VIT)
+
+
+def test_comparison_report_untrained():
+    """A report holding untrained entries must render and serialize."""
+    from datetime import datetime
+
+    from serde.json import to_json
+
+    from holod.core.compare import BackboneStats, ComparisonReport
+
+    report = ComparisonReport(
+        analysis=AnalysisType.CLASS.value,
+        num_classes=5,
+        crop_size=64,
+        batch_size=8,
+        epoch_count=1,
+        device="cpu",
+        created=datetime.now().isoformat(timespec="seconds"),
+        stats=[BackboneStats(backbone=ModelType.FOCUSNET.value, metric_name="accuracy")],
+    )
     assert [s.backbone for s in report.stats] == [ModelType.FOCUSNET.value]
     assert all(s.error is None for s in report.stats)
     assert all(s.best_val_metric is None for s in report.stats)

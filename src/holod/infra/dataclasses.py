@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, override
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, override
 
 import click
+import numpy as np
 import numpy.typing as npt
 import timm
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from serde import Untagged, serde
+from serde.toml import from_toml
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import models
@@ -19,21 +21,23 @@ from torchvision.transforms import v2
 import holod.infra.util.paths as paths
 from holod.infra.dataset import HologramFocusDataset, RegLabelTransform, TransformedDataset
 from holod.infra.log import get_logger
+from holod.infra.losses import SoftOrdinalCrossEntropy
 from holod.infra.models import FocusNetTorch, NeuralNetwork
 from holod.infra.util.types import (
     Q_,
     AnalysisType,
+    Arr64,
     CreateCSVOption,
     Mean,
     ModelType,
     StandardDev,
+    StateDict,
     SubsetList,
     UserDevice,
     u,
 )
 
 if TYPE_CHECKING:
-    import numpy as np
     import numpy.typing as npt
     from PIL.Image import Image as ImageType
     from pint.facets.plain.quantity import PlainQuantity
@@ -44,9 +48,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 HOLO_DEF = paths.data_spec("mw")
-# TODO: add to git this default path with sample data
 SAMPLE_PATH: Path = paths.data_root() / Path("MW_Dataset_Sample") / Path("ODP-DLHM-Database.csv")
 type FieldsUnion = Paths | Train | Flags
+
+# --- Helpers
 
 
 def check_csv_exists(create_csv: bool, ds_root: Path, meta_csv_name: str) -> tuple[bool, str]:
@@ -118,6 +123,9 @@ def check_csv_exists(create_csv: bool, ds_root: Path, meta_csv_name: str) -> tup
     return (use_sample_data, meta_csv_name)
 
 
+# ----
+
+
 # TODO: potentially compress some of these fields to utilize the flags, paths, and train classes
 @dataclass
 class AutoConfig:
@@ -139,23 +147,26 @@ class AutoConfig:
         num_classes: Number of classifications that can be made (only one for regression).
         backbone: The model itself.
         auto_method: Classification or regression training for the model.
+        soft_label_sigma: Std dev (in bins) of the soft ordinal target distribution
+        for classification; 0 keeps hard one-hot labels.
 
     """
 
-    analysis: AnalysisType = AnalysisType.CLASS
-    backbone: ModelType = ModelType.ENET
     batch_size: int = 16
     crop_size: int = 224
-    device_user: UserDevice = UserDevice.CUDA
     epoch_count: int = 10
-    meta_csv_strpath: str = (HOLO_DEF / Path("ODP-DLHM-Database.csv")).as_posix()
     num_classes: int = 1
     num_workers: int = 2
+    val_split: float = 0.2
+    analysis: AnalysisType = AnalysisType.CLASS
+    backbone: ModelType = ModelType.ENET
+    device_user: UserDevice = UserDevice.CUDA
+    meta_csv_strpath: str = (HOLO_DEF / Path("ODP-DLHM-Database.csv")).as_posix()
     opt_lr: float = 5e-5
     opt_weight_decay: float = 1e-2
     sch_factor: float = 0.1
     sch_patience: int = 5
-    val_split: float = 0.2
+    soft_label_sigma: float = 0.0
     fixed_seed: bool = True
     checkpoint: bool = False
 
@@ -177,6 +188,7 @@ class AutoConfig:
                 "num_classes": self.num_classes,
                 "sch_factor": self.sch_factor,
                 "sch_patience": self.sch_patience,
+                "soft_label_sigma": self.soft_label_sigma,
                 "val_split": self.val_split,
             }
         )
@@ -210,84 +222,53 @@ class AutoConfig:
         logger.debug(f"Using device: {actual_device}")
         return actual_device
 
-    def to_user_config(self) -> UserConfig:
-        """Convert from autoconfig to UserConfig."""
-        paths = Paths(
-            Path(self.meta_csv_strpath).parent.as_posix(), Path(self.meta_csv_strpath).stem
-        )
+    def to_user_config(self) -> ModelConfig:
+        """Convert from autoconfig to ModelConfig."""
         train = Train(
             self.backbone.value,
-            self.batch_size,
-            self.crop_size,
-            self.device(),
-            self.epoch_count,
             self.opt_lr,
-            self.num_classes,
-            self.num_workers,
             self.opt_weight_decay,
             self.sch_factor,
             self.sch_patience,
-            self.val_split,
         )
-        flags = Flags(
-            self.checkpoint,
-            False,  # irrelevant to repeating
-            self.fixed_seed,
-            (self.meta_csv_strpath == SAMPLE_PATH.as_posix()),  # if path == sample path
+        return ModelConfig(train)
+
+    @classmethod
+    def default(cls, analysis: AnalysisType, backbone: ModelType, num_classes: int):
+        """Build a config with conservative defaults for a given backbone and analysis."""
+        return cls(
+            analysis=analysis,
+            backbone=backbone,
+            num_classes=num_classes,
+            batch_size=8,
+            crop_size=224,
+            epoch_count=5,
+            num_workers=2,
+            val_split=0.2,
         )
-        return UserConfig(paths, train, flags)
 
     @classmethod
     def from_user(
         cls,
-        backbone: str | None,
-        batch_size: int | None,
-        crop_size: int | None,
-        checkpoint: bool | None,
-        ds_root: str | None,
-        device_user: str | None,
-        fixed_seed: bool | None,
-        meta_csv_name: str | None,
-        num_classes: int | None,
-        num_workers: int | None,
-        opt_weight_decay: float | None,
-        val_split: float | None,
-        epoch_count: int | None,
-        opt_lr: float | None,
-        create_csv: bool | None,
-        use_sample_data: bool | None,
-        sch_factor: float | None,
-        sch_patience: int | None,
+        backbone: str,
+        batch_size: int,
+        crop_size: int,
+        device_user: str,
+        num_classes: int,
+        num_workers: int,
+        val_split: float,
+        epoch_count: int,
+        meta_csv: str,
+        checkpoint: bool | None = None,
+        fixed_seed: bool | None = None,
+        opt_weight_decay: float | None = None,
+        opt_lr: float | None = None,
+        sch_factor: float | None = None,
+        sch_patience: int | None = None,
+        soft_label_sigma: float | None = None,
     ) -> AutoConfig:
         """Parse user input to ensure proper arguments are recieved."""
-        if backbone is None:
-            logger.error("No backbone passed, using efficientnet.")
-            backbone = "Enet"
-
-        backbone = backbone.lower()
-        if "vit" in backbone:
-            backbone_type = ModelType.VIT
-        elif "enet" in backbone or "efficient" in backbone:
-            backbone_type = ModelType.ENET
-        elif "res" in backbone:
-            backbone_type = ModelType.RESNET
-        elif "new" in backbone or "custom" in backbone:
-            backbone_type = ModelType.PCNN
-        elif "focus" in backbone:
-            backbone_type = ModelType.FOCUSNET
-        else:
-            raise Exception(f"Unknown backbone passed: {backbone}")
-
-        create_csv = False if create_csv is None else create_csv
-        ds_root = "" if ds_root is None else ds_root
-        meta_csv_name = "" if meta_csv_name is None else meta_csv_name
-        # resolve the dataset root so folders outside src/data (absolute, ``~``, or
-        # cwd-relative paths) load the same way bundled datasets do
-        ds_root_path = paths.resolve_dataset_root(ds_root)
-        if not use_sample_data:
-            (use_sample_data, meta_csv_name) = check_csv_exists(
-                create_csv, ds_root_path, meta_csv_name
-            )
+        backbone_type = ModelType.from_str(backbone) if backbone is not None else ModelType.ENET
 
         # WARN: not robust for all types, will need a change <05-09-25>
         if backbone_type == ModelType.VIT and crop_size != 224:
@@ -297,37 +278,17 @@ class AutoConfig:
             )
             crop_size = 224
 
-        # ensure the user has the sample data
-        if use_sample_data:
-            logger.warning(f"Ensuring {SAMPLE_PATH} exists...")
-            if SAMPLE_PATH.exists():
-                meta_csv_strpath: str = SAMPLE_PATH.as_posix()
-                logger.info(f"{meta_csv_strpath} exists, continuing with sample data...")
-            else:
-                raise Exception(f"Path to sample data does not exist: {SAMPLE_PATH}")
-        else:
-            meta_csv_strpath = (ds_root_path / meta_csv_name).as_posix()
-
-        # ensure not None
-        backbone_type = backbone_type if backbone_type is not None else ModelType.ENET
-        device_user = device_user if device_user is not None else UserDevice.CUDA.value
-        batch_size = batch_size if batch_size is not None else 16
+        # ensure not None; fall back to the class-level defaults
         checkpoint = checkpoint if checkpoint is not None else False
-        crop_size = crop_size if crop_size is not None else 224
-        epoch_count = epoch_count if epoch_count is not None else 10
         fixed_seed = fixed_seed if fixed_seed is not None else True
-        meta_csv_strpath = (
-            meta_csv_strpath
-            if meta_csv_strpath is not None
-            else (HOLO_DEF / Path("ODP-DLHM-Database.csv")).as_posix()
-        )
-        num_classes = num_classes if num_classes is not None else 10
         opt_lr = opt_lr if opt_lr is not None else 5e-5
-        val_split = val_split if val_split is not None else 0.2
-        num_workers = num_workers if num_workers is not None else 1
-        opt_weight_decay = opt_weight_decay if opt_weight_decay is not None else 0.1
-        sch_factor = sch_factor if sch_factor is not None else 5
+        opt_weight_decay = opt_weight_decay if opt_weight_decay is not None else 1e-2
+        # ReduceLROnPlateau requires factor < 1.0
+        sch_factor = sch_factor if sch_factor is not None else 0.1
         sch_patience = sch_patience if sch_patience is not None else 5
+        soft_label_sigma = soft_label_sigma if soft_label_sigma is not None else 0.0
+        if soft_label_sigma < 0:
+            raise ValueError(f"soft_label_sigma must be >= 0, got {soft_label_sigma}.")
 
         return cls(
             analysis=AnalysisType.CLASS if num_classes != 1 else AnalysisType.REG,
@@ -335,10 +296,10 @@ class AutoConfig:
             batch_size=batch_size,
             checkpoint=checkpoint,
             crop_size=crop_size,
-            device_user=UserDevice(device_user),
+            device_user=UserDevice.determine(device_user),
             epoch_count=epoch_count,
             fixed_seed=fixed_seed,
-            meta_csv_strpath=meta_csv_strpath,
+            meta_csv_strpath=meta_csv,
             num_classes=num_classes,
             opt_lr=opt_lr,
             val_split=val_split,
@@ -346,89 +307,233 @@ class AutoConfig:
             opt_weight_decay=opt_weight_decay,
             sch_factor=sch_factor,
             sch_patience=sch_patience,
+            soft_label_sigma=soft_label_sigma,
         )
 
 
 @serde
 class Paths:
-    dataset_root: str | None
-    meta_csv_name: str | None
+    """Dataset location settings shared by every configured model."""
+
+    dataset_root: str = ""
+    meta_csv_name: str = ""
+
+    @classmethod
+    def empty(cls):
+        """Return a Paths instance with both fields unset (never overrides on merge)."""
+        return cls(dataset_root="", meta_csv_name="")
 
 
 @serde
 class Train:
-    backbone: str | None
-    batch_size: int | None
-    crop_size: int | None
-    device: str | None
-    epoch_count: int | None
-    learning_rate: float | None
-    num_classes: int | None
-    num_workers: int | None
-    optimizer_weight_decay: float | None
-    sch_factor: float | None
-    sch_patience: int | None
-    val_split: float | None
+    """Per-model training settings (optimizer and scheduler)."""
+
+    backbone: str
+    learning_rate: float | None = None
+    optimizer_weight_decay: float | None = None
+    sch_factor: float | None = None
+    sch_patience: int | None = None
 
 
 @serde
 class Flags:
-    checkpoint: bool | None
-    create_csv: bool | None
-    fixed_seed: bool | None
-    sample: bool | None
+    """Boolean toggles shared by every configured model; ``None`` means unset."""
+
+    checkpoint: bool | None = None
+    create_csv: bool | None = None
+    fixed_seed: bool | None = None
+    sample: bool | None = None
+
+    @classmethod
+    def empty(cls):
+        """Return a Flags instance with every flag unset (never overrides on merge)."""
+        return cls(checkpoint=None, create_csv=None, fixed_seed=None, sample=None)
 
 
 @serde(tagging=Untagged)
-class UserConfig:
+class ModelConfig:
     """Dataclass that deserializes the config file via serde."""
 
-    paths: Paths
     train: Train
-    flags: Flags
 
     @override
     def __repr__(self):
         """Return the proprerly formatted string representation of config."""
-        return f"ConfigFile('{self.paths}'\n'{self.train}'\n'{self.flags}')"
+        return f"ConfigFile('{self.train}')"
 
-    def merge(self, paths: Paths | None, train: Train | None, flags: Flags | None) -> None:
-        """Merge commandline inputs with an existing user config instance."""
-        # check to see if any arguments have been passed
-        if paths is not None:
-            self._merge_group(self.paths, paths)
-        if train is not None:
-            self._merge_group(self.train, train)
-        if flags is not None:
-            self._merge_group(self.flags, flags)
+
+@serde(tagging=Untagged)
+class CompareUserConfig:
+    """Dataclass that deserializes a per-model config file via serde."""
+
+    paths: Paths
+    flags: Flags
+    batch_size: int = 16
+    crop_size: int = 224
+    device: str = "cuda"
+    epoch_count: int = 10
+    num_classes: int = 10
+    num_workers: int = 2
+    val_split: float = 0.2
+    soft_label_sigma: float = 0.0
+    enet: ModelConfig | None = None
+    focusnet: ModelConfig | None = None
+    pcnn: ModelConfig | None = None
+    resnet: ModelConfig | None = None
+    vit: ModelConfig | None = None
+
+    def __post_init__(self):
+        """Ensure that at least one model is configured."""
+        if not self.configured_backbones():
+            raise Exception("No model is configured! Must have at least one backbone configured.")
+        self._paths_resolved: bool = False
+
+    def resolve_paths(self) -> CompareUserConfig:
+        """Resolve the dataset root and metadata CSV into absolute paths.
+
+        Must be called after ``merge`` (so CLI paths are already applied) and before
+        the config is used to load a dataset. Validates that the dataset and CSV
+        exist, prompting the user as needed, and rewrites ``paths`` in-place to the
+        resolved absolute locations. Idempotent: repeated calls are no-ops.
+        """
+        if self._paths_resolved:
+            return self
+
+        create_csv = False if self.flags.create_csv is None else self.flags.create_csv
+        meta_csv = self.paths.meta_csv_name
+        # resolve the dataset root so folders outside src/data (absolute, ``~``, or
+        # cwd-relative paths) load the same way bundled datasets do
+        ds_root_path = paths.resolve_dataset_root(self.paths.dataset_root)
+        use_sample_data = self.flags.sample
+        if not self.flags.sample:
+            (use_sample_data, meta_csv) = check_csv_exists(create_csv, ds_root_path, meta_csv)
+        # ensure the user has the sample data
+        meta_csv_path: Path
+        if use_sample_data:
+            logger.warning(f"Ensuring {SAMPLE_PATH} exists...")
+            if SAMPLE_PATH.exists():
+                meta_csv_path = SAMPLE_PATH
+                logger.info(f"{meta_csv_path} exists, continuing with sample data...")
+            else:
+                raise Exception(f"Path to sample data does not exist: {SAMPLE_PATH}")
+        else:
+            meta_csv_path = ds_root_path / meta_csv
+        self.paths.dataset_root = ds_root_path.as_posix()
+        self.paths.meta_csv_name = meta_csv_path.as_posix()
+        self._paths_resolved = True
+        return self
 
     def _merge_group(self, target: FieldsUnion, source: FieldsUnion) -> None:
         for f in fields(source):
             name: str = f.name
             value: Any = getattr(source, name)
-            if value is not None:
+            # empty strings mean "unset" for Paths fields; never clobber with them
+            if value is not None and value != "":
                 setattr(target, name, value)
 
-    def to_auto_config(self) -> AutoConfig:
+    def merge(
+        self,
+        flags: Flags | None = None,
+        paths: Paths | None = None,
+        batch_size: int | None = None,
+        device: str | None = None,
+        crop_size: int | None = None,
+        epoch_count: int | None = None,
+        num_classes: int | None = None,
+        num_workers: int | None = None,
+        val_split: float | None = None,
+        soft_label_sigma: float | None = None,
+    ):
+        """Merge commandline inputs with an existing user config instance."""
+        if batch_size is not None:
+            self.batch_size = batch_size
+        if device is not None:
+            self.device = device
+        if crop_size is not None:
+            self.crop_size = crop_size
+        if epoch_count is not None:
+            self.epoch_count = epoch_count
+        if num_classes is not None:
+            self.num_classes = num_classes
+        if num_workers is not None:
+            self.num_workers = num_workers
+        if val_split is not None:
+            self.val_split = val_split
+        if soft_label_sigma is not None:
+            self.soft_label_sigma = soft_label_sigma
+        if paths is not None:
+            self._merge_group(self.paths, paths)
+        if flags is not None:
+            self._merge_group(self.flags, flags)
+        return self
+
+    def model_config(self, backbone: ModelType) -> ModelConfig | None:
+        """Return the per-model config for a backbone, or ``None`` if unconfigured."""
+        match backbone:
+            case ModelType.ENET:
+                return self.enet
+            case ModelType.FOCUSNET:
+                return self.focusnet
+            case ModelType.PCNN:
+                return self.pcnn
+            case ModelType.RESNET:
+                return self.resnet
+            case ModelType.VIT:
+                return self.vit
+
+    def configured_backbones(self) -> list[ModelType]:
+        """Return the backbones that have a per-model config in this file."""
+        return [m for m in ModelType if self.model_config(m) is not None]
+
+    @staticmethod
+    def from_toml(toml: Path):
+        """Deserialize a config instance from a TOML file (see train_settings.toml)."""
+        with open(toml) as config_file:
+            return from_toml(CompareUserConfig, config_file.read())
+
+    @classmethod
+    def from_model_config(cls, model_config: ModelConfig):
+        """Build a config around a single model, with paths and flags left unset."""
+        backbone = ModelType.from_str(model_config.train.backbone)
+        match backbone:
+            case ModelType.ENET:
+                return cls(Paths.empty(), Flags.empty(), enet=model_config)
+            case ModelType.FOCUSNET:
+                return cls(Paths.empty(), Flags.empty(), focusnet=model_config)
+            case ModelType.PCNN:
+                return cls(Paths.empty(), Flags.empty(), pcnn=model_config)
+            case ModelType.RESNET:
+                return cls(Paths.empty(), Flags.empty(), resnet=model_config)
+            case ModelType.VIT:
+                return cls(Paths.empty(), Flags.empty(), vit=model_config)
+
+    def to_auto_config(self, backbone: ModelType) -> AutoConfig:
+        """Build the runtime ``AutoConfig`` for one configured backbone."""
+        t_cfg = self.model_config(backbone)
+        if t_cfg is None:
+            raise KeyError(
+                f"Selected backbone: {backbone.value} is not configured, "
+                f"available backbones: {[m.value for m in self.configured_backbones()]}"
+            )
         return AutoConfig.from_user(
-            backbone=self.train.backbone,
-            batch_size=self.train.batch_size,
+            batch_size=self.batch_size,
+            crop_size=self.crop_size,
+            device_user=self.device,
+            epoch_count=self.epoch_count,
+            num_classes=self.num_classes,
+            num_workers=self.num_workers,
+            val_split=self.val_split,
+            soft_label_sigma=self.soft_label_sigma,
+            # paths & flags
+            meta_csv=self.paths.meta_csv_name,
             checkpoint=self.flags.checkpoint,
-            crop_size=self.train.crop_size,
-            create_csv=self.flags.create_csv,
-            device_user=self.train.device,
-            ds_root=self.paths.dataset_root,
-            epoch_count=self.train.epoch_count,
             fixed_seed=self.flags.fixed_seed,
-            meta_csv_name=self.paths.meta_csv_name,
-            num_classes=self.train.num_classes,
-            num_workers=self.train.num_workers,
-            opt_lr=self.train.learning_rate,
-            opt_weight_decay=self.train.optimizer_weight_decay,
-            sch_factor=self.train.sch_factor,
-            sch_patience=self.train.sch_patience,
-            use_sample_data=self.flags.sample,
-            val_split=self.train.val_split,
+            # train cfg
+            backbone=t_cfg.train.backbone,
+            opt_lr=t_cfg.train.learning_rate,
+            opt_weight_decay=t_cfg.train.optimizer_weight_decay,
+            sch_factor=t_cfg.train.sch_factor,
+            sch_patience=t_cfg.train.sch_patience,
         )
 
 
@@ -487,13 +592,12 @@ class CoreTrainer:
     def check_loss(self, labels_tens: Tensor, pred: Tensor):
         # TODO: this check is done every time, probably should set this once as an operation
         # to perform and reuse it
-        if self.backbone == ModelType.PCNN:
-            labels_tens = labels_tens.float()
-        elif isinstance(self.loss_fn, nn.MSELoss):
+        if isinstance(self.loss_fn, nn.MSELoss):
             labels_tens = labels_tens.float()  # expects float
         elif isinstance(self.loss_fn, nn.BCEWithLogitsLoss):
             labels_tens = labels_tens.float()  # BCE expects float 0/1
-        elif isinstance(self.loss_fn, nn.CrossEntropyLoss):
+        elif isinstance(self.loss_fn, nn.CrossEntropyLoss | SoftOrdinalCrossEntropy):
+            # SoftOrdinalCrossEntropy also takes hard indices; it softens them internally
             labels_tens = labels_tens.long()
             # fail fast with a readable error; a mismatch here otherwise surfaces as an
             # opaque CUDA device-side assert in backward()
@@ -561,9 +665,146 @@ class TrainingOutput:
 class TrainingRepeatConfig:
     """Stores the relevant inforamtion concerning the report for training."""
 
-    user_config: UserConfig
+    user_config: ModelConfig
     avg_train_loss: float
     avg_val_loss: float
+
+
+@dataclass
+class Checkpoint:
+    """Serialized training state used for resuming."""
+
+    epoch: int
+    model_state_dict: StateDict
+    labels: torch.Tensor
+    bin_centers: Arr64 | None
+    num_classes: int
+    val_metric: float
+    model_type: ModelType
+    # z-label normalization stats (regression only); None on classification
+    # checkpoints and on checkpoints written before these fields existed
+    z_avg: float | None = None
+    z_std: float | None = None
+
+    @classmethod
+    def from_dict(cls, torch_dict: dict[str, Any]) -> Checkpoint:
+        """Rebuild a checkpoint from the dictionary written by torch_save."""
+        return cls(
+            epoch=torch_dict["epoch"],
+            model_state_dict=torch_dict["model_state_dict"],
+            labels=torch_dict["labels"],
+            val_metric=torch_dict["val_metric"],
+            bin_centers=torch_dict["bin_centers"],
+            num_classes=torch_dict["num_classes"],
+            model_type=torch_dict["model_type"],
+            z_avg=torch_dict.get("z_avg"),
+            z_std=torch_dict.get("z_std"),
+        )
+
+    @classmethod
+    def from_epoch(
+        cls,
+        epoch: int,
+        core_trainer: CoreTrainer,
+        labels_tensor,
+        val_metric: float,
+    ) -> Checkpoint:
+        """Build a checkpoint from the current epoch's training state."""
+        (z_avg, z_std) = core_trainer.get_std_avg(core_trainer.a_cfg.analysis)
+        return cls(
+            epoch=epoch,
+            model_state_dict=core_trainer.model.state_dict(),
+            labels=labels_tensor,
+            val_metric=val_metric,
+            bin_centers=core_trainer.bin_centers,
+            num_classes=core_trainer.a_cfg.num_classes,
+            model_type=core_trainer.a_cfg.backbone,
+            z_avg=float(z_avg) if z_avg is not None else None,
+            z_std=float(z_std) if z_std is not None else None,
+        )
+
+    def torch_save(self, path) -> None:
+        torch.save(
+            asdict(self),
+            path,
+        )
+
+
+@dataclass
+class ModelCheckpoint:
+    """Serialized training state used for models."""
+
+    checkpoint: Checkpoint
+    optimizer_state_dict: StateDict
+    train_loss: float
+    val_loss: float
+
+    # torch.load(weights_only=True) only unpickles allowlisted types; besides tensors
+    # and primitives, the saved dict holds a ModelType enum and numpy bin_centers.
+    SAFE_GLOBALS: ClassVar[list[Any]] = [
+        ModelType,
+        np.ndarray,
+        np.dtype,
+        np.dtypes.Float64DType,
+        np._core.multiarray._reconstruct,  # numpy's ndarray pickle helper  # pyright: ignore[reportAttributeAccessIssue]
+    ]
+
+    @classmethod
+    def from_epoch(
+        cls,
+        epoch: int,
+        core_trainer: CoreTrainer,
+        labels_tensor,
+        val_metric: float,
+        optimizer_state_dict: StateDict,
+        train_loss: float,
+        val_loss: float,
+    ) -> ModelCheckpoint:
+        # Awlays save latest model, after going through both loaders
+        checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, val_metric)
+        return cls(
+            checkpoint=checkpoint,
+            optimizer_state_dict=optimizer_state_dict,
+            train_loss=train_loss,
+            val_loss=val_loss,
+        )
+
+    @classmethod
+    def load_ckpt(
+        cls, path_ckpt: str, optimizer: Optimizer, model: nn.Module, device: str
+    ) -> ModelCheckpoint:
+        """Load a training checkpoint, restore optimizer and model state."""
+        with torch.serialization.safe_globals(cls.SAFE_GLOBALS):
+            torch_dict: dict[str, Any] = torch.load(
+                path_ckpt, weights_only=True, map_location=device
+            )
+        checkpoint = Checkpoint.from_dict(torch_dict["checkpoint"])
+        # returns unexpected keys or missing keys for the model if either case occurs
+        incompatible = model.load_state_dict(checkpoint.model_state_dict)
+        # must move model onto expected device before loading optimiser
+        _ = model.to(device)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            logger.warning(f"State dict load mismatch: {incompatible}")
+
+        ckpt: ModelCheckpoint = cls(
+            checkpoint=checkpoint,
+            optimizer_state_dict=torch_dict["optimizer_state_dict"],
+            train_loss=torch_dict["train_loss"],
+            val_loss=torch_dict["val_loss"],
+        )
+        optimizer.load_state_dict(ckpt.optimizer_state_dict)
+        logger.info(
+            f"Resumed from checkpoint {path_ckpt} "
+            + f"(epoch {checkpoint.epoch}, val_metric {checkpoint.val_metric:.4g})"
+        )
+
+        return ckpt
+
+    def torch_save(self, path) -> None:
+        torch.save(
+            asdict(self),
+            path,
+        )
 
 
 def create_autofocus_model(a_cfg: AutoConfig) -> nn.Module:
@@ -654,7 +895,16 @@ def create_training_setup(base: HologramFocusDataset, a_cfg: AutoConfig) -> Core
     logger.debug("Dataloaders created successfully")
 
     # reg options: nn.BCEWithLogitsLoss(), nn.MSELoss()
-    loss_fn = nn.CrossEntropyLoss() if a_cfg.analysis == AnalysisType.CLASS else nn.MSELoss()
+    loss_fn: nn.Module
+    if a_cfg.analysis == AnalysisType.CLASS:
+        if a_cfg.soft_label_sigma > 0:
+            # soft ordinal targets (SORD): near-miss bins keep some probability
+            # mass, so the loss respects the depth ordering of the bins
+            loss_fn = SoftOrdinalCrossEntropy(a_cfg.num_classes, a_cfg.soft_label_sigma)
+        else:
+            loss_fn = nn.CrossEntropyLoss()
+    else:
+        loss_fn = nn.MSELoss()
     model = create_autofocus_model(a_cfg)
 
     # optimizer should only be created after model

@@ -1,8 +1,9 @@
 """Tests for dataset-root resolution and the CSV/dataset config loading cases.
 
 Covers ``paths.resolve_dataset_root``, ``check_csv_exists`` (every
-``CreateCSVOption`` branch), ``AutoConfig.from_user`` path building, and
-loading a ``HologramFocusDataset`` from a folder outside ``src/data``.
+``CreateCSVOption`` branch), ``CompareUserConfig`` loading/merging/path
+resolution, and loading a ``HologramFocusDataset`` from a folder outside
+``src/data``.
 """
 
 from __future__ import annotations
@@ -16,9 +17,17 @@ import pytest
 from PIL import Image
 
 import holod.infra.util.paths as paths
-from holod.infra.dataclasses import SAMPLE_PATH, AutoConfig, check_csv_exists
+from holod.infra.dataclasses import (
+    SAMPLE_PATH,
+    CompareUserConfig,
+    Flags,
+    ModelConfig,
+    Paths,
+    Train,
+    check_csv_exists,
+)
 from holod.infra.dataset import HologramFocusDataset
-from holod.infra.util.types import AnalysisType
+from holod.infra.util.types import AnalysisType, ModelType
 
 CSV_NAME = "meta.csv"
 NUM_IMAGES = 32
@@ -57,30 +66,22 @@ def make_external_dataset(root: Path, *, with_csv: bool = True, with_info: bool 
     return csv_path
 
 
-def build_config(**overrides: object) -> AutoConfig:
-    """Call ``AutoConfig.from_user`` with sane defaults, overriding per test."""
+def build_config(**overrides: object) -> CompareUserConfig:
+    """Build a single-model ``CompareUserConfig`` with sane defaults, overriding per test."""
     kwargs: dict[str, object] = {
-        "backbone": "enet",
+        "paths": Paths.empty(),
+        "flags": Flags(checkpoint=False, create_csv=False, fixed_seed=True, sample=False),
         "batch_size": 4,
         "crop_size": 64,
-        "checkpoint": False,
-        "ds_root": None,
-        "device_user": "cpu",
-        "fixed_seed": True,
-        "meta_csv_name": None,
+        "device": "cpu",
+        "epoch_count": 1,
         "num_classes": 5,
         "num_workers": 0,
-        "opt_weight_decay": None,
         "val_split": 0.2,
-        "epoch_count": 1,
-        "opt_lr": None,
-        "create_csv": False,
-        "use_sample_data": False,
-        "sch_factor": None,
-        "sch_patience": None,
+        "enet": ModelConfig(Train("enet")),
     }
     kwargs.update(overrides)
-    return AutoConfig.from_user(**kwargs)  # pyright: ignore[reportArgumentType]
+    return CompareUserConfig(**kwargs)  # pyright: ignore[reportArgumentType]
 
 
 # -- resolve_dataset_root ----------------------------------------------------------------------
@@ -182,39 +183,110 @@ def test_check_csv_empty_name_treated_as_missing(tmp_path: Path, monkeypatch: py
     assert use_sample is True
 
 
-# -- AutoConfig.from_user ----------------------------------------------------------------------
+# -- CompareUserConfig: resolve_paths / merge / to_auto_config ----------------------------------
 
 
-def test_from_user_external_absolute_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_resolve_external_absolute_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """An absolute dataset root outside src/data flows into meta_csv_strpath."""
     csv_path = make_external_dataset(tmp_path / "ds")
     _ban_user_prompts(monkeypatch)
-    cfg = build_config(ds_root=str(tmp_path / "ds"), meta_csv_name=CSV_NAME)
-    assert cfg.meta_csv_strpath == csv_path.as_posix()
-    assert cfg.analysis == AnalysisType.CLASS
+    cfg = build_config(paths=Paths(str(tmp_path / "ds"), CSV_NAME)).resolve_paths()
+    a_cfg = cfg.to_auto_config(ModelType.ENET)
+    assert a_cfg.meta_csv_strpath == csv_path.as_posix()
+    assert a_cfg.analysis == AnalysisType.CLASS
 
 
-def test_from_user_cwd_relative_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_resolve_cwd_relative_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A dataset root relative to the working directory resolves correctly."""
     csv_path = make_external_dataset(tmp_path / "ds")
     _ban_user_prompts(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    cfg = build_config(ds_root="ds", meta_csv_name=CSV_NAME)
-    assert Path(cfg.meta_csv_strpath) == csv_path.resolve()
+    cfg = build_config(paths=Paths("ds", CSV_NAME)).resolve_paths()
+    assert Path(cfg.to_auto_config(ModelType.ENET).meta_csv_strpath) == csv_path.resolve()
 
 
-def test_from_user_sample_flag_skips_dataset_checks(monkeypatch: pytest.MonkeyPatch):
+def test_resolve_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Calling resolve_paths twice must not re-resolve or re-prompt."""
+    csv_path = make_external_dataset(tmp_path / "ds")
+    _ban_user_prompts(monkeypatch)
+    cfg = build_config(paths=Paths(str(tmp_path / "ds"), CSV_NAME)).resolve_paths()
+    first = cfg.paths.meta_csv_name
+    assert cfg.resolve_paths().paths.meta_csv_name == first == csv_path.as_posix()
+
+
+def test_resolve_sample_flag_skips_dataset_checks(monkeypatch: pytest.MonkeyPatch):
     """--sample uses the bundled sample CSV and never prompts."""
     _ban_user_prompts(monkeypatch)
-    cfg = build_config(use_sample_data=True)
-    assert cfg.meta_csv_strpath == SAMPLE_PATH.as_posix()
+    flags = Flags(checkpoint=False, create_csv=False, fixed_seed=True, sample=True)
+    cfg = build_config(flags=flags).resolve_paths()
+    assert cfg.to_auto_config(ModelType.ENET).meta_csv_strpath == SAMPLE_PATH.as_posix()
 
 
-def test_from_user_regression_analysis(monkeypatch: pytest.MonkeyPatch):
+def test_regression_analysis(monkeypatch: pytest.MonkeyPatch):
     """A single class selects regression analysis."""
     _ban_user_prompts(monkeypatch)
-    cfg = build_config(use_sample_data=True, num_classes=1)
-    assert cfg.analysis == AnalysisType.REG
+    flags = Flags(checkpoint=False, create_csv=False, fixed_seed=True, sample=True)
+    cfg = build_config(flags=flags, num_classes=1).resolve_paths()
+    assert cfg.to_auto_config(ModelType.ENET).analysis == AnalysisType.REG
+
+
+def test_merge_keeps_config_paths_when_cli_unset():
+    """Empty CLI path strings must not clobber values from the config file."""
+    cfg = build_config(paths=Paths("some_ds", "meta.csv"))
+    _ = cfg.merge(paths=Paths.empty(), flags=Flags.empty(), batch_size=8)
+    assert cfg.paths.dataset_root == "some_ds"
+    assert cfg.paths.meta_csv_name == "meta.csv"
+    assert cfg.batch_size == 8
+
+
+def test_from_toml_multi_model_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The multi-model TOML schema deserializes and maps onto AutoConfig."""
+    ds = tmp_path / "ds"
+    csv_path = make_external_dataset(ds)
+    toml_file = tmp_path / "train_settings.toml"
+    toml_file.write_text(
+        f"""
+batch_size = 4
+crop_size = 64
+device = "cpu"
+epoch_count = 1
+num_classes = 5
+num_workers = 0
+val_split = 0.2
+
+[paths]
+dataset_root = "{ds.as_posix()}"
+meta_csv_name = "{CSV_NAME}"
+
+[flags]
+checkpoint = false
+create_csv = false
+fixed_seed = true
+sample = false
+
+[enet.train]
+backbone = "enet"
+learning_rate = 1e-4
+optimizer_weight_decay = 1e-2
+sch_factor = 0.1
+sch_patience = 7
+
+[focusnet.train]
+backbone = "focusnet"
+learning_rate = 1e-3
+"""
+    )
+    _ban_user_prompts(monkeypatch)
+    cfg = CompareUserConfig.from_toml(toml_file)
+    assert set(cfg.configured_backbones()) == {ModelType.ENET, ModelType.FOCUSNET}
+    a_cfg = cfg.resolve_paths().to_auto_config(ModelType.ENET)
+    assert a_cfg.meta_csv_strpath == csv_path.as_posix()
+    assert a_cfg.opt_lr == 1e-4
+    assert a_cfg.sch_patience == 7
+    # the focusnet section leaves scheduler fields unset; defaults must be valid
+    focus_cfg = cfg.to_auto_config(ModelType.FOCUSNET)
+    assert focus_cfg.opt_lr == 1e-3
+    assert 0 < focus_cfg.sch_factor < 1  # ReduceLROnPlateau requires factor < 1
 
 
 # -- end-to-end dataset load -------------------------------------------------------------------

@@ -5,8 +5,10 @@ from typing import TYPE_CHECKING, Any
 import click
 import numpy.typing as npt
 
+from holod.infra.dataclasses import CompareUserConfig
 from holod.infra.log import get_logger, init_logging
 from holod.infra.util.paths import checkpoints_loc, data_spec, path_check, report_path
+from holod.infra.util.types import ModelType
 
 if TYPE_CHECKING:
     from holod.core.plots import PlotPred
@@ -14,6 +16,7 @@ if TYPE_CHECKING:
 # Must be called before anything logs
 init_logging()
 logger = get_logger(__name__)
+TRAIN_SETTINGS_STR = "train_settings.toml"
 
 
 @click.group()
@@ -41,8 +44,8 @@ def cli():
 @click.option(
     "--model",
     "backbone",
-    default=None,
-    type=click.Choice(["efficientnet", "vit", "resnet50", "focusnet", "new"]),
+    default="efficientnet",
+    type=click.Choice(["efficientnet", "vit", "resnet50", "focusnet", "pcnn"]),
     help="Model backbone name.",
 )
 @click.option(
@@ -87,6 +90,13 @@ def cli():
     type=click.Choice(["cuda", "cpu"]),
     help="Device for training.",
 )
+@click.option(
+    "--soft-sigma",
+    "soft_label_sigma",
+    default=None,
+    type=click.FloatRange(0.0, 100.0),
+    help="Std dev (in bins) for soft ordinal classification labels; 0 keeps hard labels.",
+)
 @click.option("--fixed-seed", "fixed_seed", default=None, help="Keep the random seed consistent.")
 @click.option(
     "--continue",
@@ -101,13 +111,14 @@ def train(
     ds_root: str | None,
     meta_csv_name: str | None,
     num_classes: int | None,
-    backbone: str | None,
+    backbone: str,
     crop_size: int | None,
     val_split: float | None,
     batch_size: int | None,
     epoch_count: int | None,
     learning_rate: float | None,
     device_user: str | None,
+    soft_label_sigma: float | None,
     fixed_seed: bool | None,
     continue_train: bool | None,
     create_csv: bool | None,
@@ -119,9 +130,7 @@ def train(
     relative to the current directory, or an absolute path anywhere on disk.
     When omitted, the dataset_root from train_settings.toml is used.
     """
-    from serde.toml import from_toml
-
-    from holod.infra.dataclasses import AutoConfig, Flags, Paths, Train, UserConfig
+    from holod.infra.dataclasses import AutoConfig, Flags, ModelConfig, Paths, Train
     from holod.infra.training import train_autofocus
 
     # TODO: make mutually exclusive pairs of the following for the user to prevent odd cases:
@@ -132,28 +141,23 @@ def train(
 
     autofocus_config: AutoConfig
     path_ckpt: str | None = None
-    if Path("train_settings.toml").exists():
-        with open("train_settings.toml") as config_file:
-            config_text = config_file.read()
-        config = from_toml(UserConfig, config_text)
-        # merge the config file (if it exists), by overwriting it with CLI args
+    ds_root = ds_root if ds_root is not None else ""
+    meta_csv_name = meta_csv_name if meta_csv_name is not None else ""
+    train_settings = Path(TRAIN_SETTINGS_STR)
+    selected = ModelType.from_str(backbone)
+    if train_settings.exists():
+        config = CompareUserConfig.from_toml(train_settings)
+        # merge the config file, by overwriting it with CLI args
         config.merge(
+            flags=Flags(None, create_csv, fixed_seed, use_sample_data),
             paths=Paths(ds_root, meta_csv_name),
-            train=Train(
-                backbone,
-                batch_size,
-                crop_size,
-                device_user,
-                epoch_count,
-                learning_rate,
-                num_classes,
-                None,
-                None,
-                None,
-                None,
-                val_split,
-            ),
-            flags=Flags(continue_train, create_csv, fixed_seed, use_sample_data),
+            batch_size=batch_size,
+            crop_size=crop_size,
+            device=device_user,
+            epoch_count=epoch_count,
+            val_split=val_split,
+            num_classes=num_classes,
+            soft_label_sigma=soft_label_sigma,
         )
         if (config.flags.checkpoint or continue_train) is True:
             latest_ckpt = checkpoints_loc() / "latest_checkpoint.tar"
@@ -161,29 +165,36 @@ def train(
                 path_ckpt = latest_ckpt.as_posix()
             else:
                 logger.warning(f"No checkpoint found at {latest_ckpt}, starting fresh.")
-        autofocus_config = config.to_auto_config()
+        # --lr targets the selected model's config, since learning rate is per-model now
+        model_config = config.model_config(selected)
+        if learning_rate is not None and model_config is not None:
+            model_config.train.learning_rate = learning_rate
+        autofocus_config = config.resolve_paths().to_auto_config(selected)
 
-    elif ds_root is not None:
+    elif ds_root != "":
         # no config file, but a dataset was supplied on the CLI: build the config
         # purely from CLI arguments so external dataset folders still work
         logger.warning("Config file 'train_settings.toml' not found, using CLI arguments only.")
-        config = UserConfig(
-            paths=Paths(ds_root, meta_csv_name),
+        model_config = ModelConfig(
             train=Train(
-                backbone,
-                batch_size,
-                crop_size,
-                device_user,
-                epoch_count,
-                learning_rate,
-                num_classes,
-                None,
-                None,
-                None,
-                None,
-                val_split,
-            ),
-            flags=Flags(continue_train, create_csv, fixed_seed, use_sample_data),
+                backbone=backbone,
+                learning_rate=learning_rate,
+                optimizer_weight_decay=None,
+                sch_factor=None,
+                sch_patience=None,
+            )
+        )
+        config = CompareUserConfig.from_model_config(model_config)
+        config = config.merge(
+            flags=Flags(None, create_csv, fixed_seed, use_sample_data),
+            paths=Paths(ds_root, meta_csv_name),
+            batch_size=batch_size,
+            crop_size=crop_size,
+            device=device_user,
+            epoch_count=epoch_count,
+            val_split=val_split,
+            num_classes=num_classes,
+            soft_label_sigma=soft_label_sigma,
         )
         if continue_train is True:
             latest_ckpt = checkpoints_loc() / "latest_checkpoint.tar"
@@ -191,14 +202,10 @@ def train(
                 path_ckpt = latest_ckpt.as_posix()
             else:
                 logger.warning(f"No checkpoint found at {latest_ckpt}, starting fresh.")
-        autofocus_config = config.to_auto_config()
+        autofocus_config = config.resolve_paths().to_auto_config(selected)
 
     else:
-        logger.error(
-            "Config file not found, expected 'train_settings.toml' in repo root. Using \
-        default settings."
-        )
-        autofocus_config = AutoConfig()
+        raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
 
     plot_info: PlotPred = train_autofocus(autofocus_config, path_ckpt)
     plot_info.save_to_file()
@@ -241,27 +248,20 @@ def train(
     help="Number of training epochs per backbone.",
 )
 @click.option(
-    "--lr",
-    "learning_rate",
-    default=None,
-    type=click.FloatRange(1e-6, 1e2),
-    help="How fast should the model adapt epoch to epoch",
-)
-@click.option(
     "--device",
     "device_user",
     default=None,
     type=click.Choice(["cuda", "cpu"]),
     help="Device for training.",
 )
-@click.option("--sample", "use_sample_data", default=None, help="Use sample data provided.")
 @click.option(
-    "--skip-train",
-    "skip_train",
-    is_flag=True,
-    default=False,
-    help="Only report architecture and inference statistics; skip training.",
+    "--soft-sigma",
+    "soft_label_sigma",
+    default=None,
+    type=click.FloatRange(0.0, 100.0),
+    help="Std dev (in bins) for soft ordinal classification labels; 0 keeps hard labels.",
 )
+@click.option("--sample", "use_sample_data", default=None, help="Use sample data provided.")
 @click.option(
     "--display",
     default="save",
@@ -274,72 +274,38 @@ def compare(
     crop_size: int | None,
     batch_size: int | None,
     epoch_count: int | None,
-    learning_rate: float | None,
     device_user: str | None,
+    soft_label_sigma: float | None,
     use_sample_data: bool | None,
-    skip_train: bool,
     display: str,
 ) -> None:
-    """Compare each model backbone under one shared configuration."""
-    from serde.toml import from_toml
-
+    """Compare each configured model backbone under the shared configuration."""
     from holod.core.compare import compare_backbones
-    from holod.infra.dataclasses import AutoConfig, Flags, Paths, Train, UserConfig
+    from holod.infra.dataclasses import Flags, Paths
     from holod.infra.log import console_ as console
-    from holod.infra.util.types import AnalysisType, DisplayType, ModelType, UserDevice
+    from holod.infra.util.types import DisplayType, ModelType
 
     selected = [ModelType(m) for m in models] if models else None
 
-    autofocus_config: AutoConfig
-    if skip_train:
-        # NOTE: static statistics need no dataset; build the config directly from CLI values
-        overrides: dict[str, Any] = {
-            key: value
-            for key, value in {
-                "num_classes": num_classes,
-                "crop_size": crop_size,
-                "batch_size": batch_size,
-                "epoch_count": epoch_count,
-                "opt_lr": learning_rate,
-            }.items()
-            if value is not None
-        }
-        if device_user is not None:
-            overrides["device_user"] = UserDevice(device_user)
-        if num_classes is not None:
-            overrides["analysis"] = AnalysisType.CLASS if num_classes != 1 else AnalysisType.REG
-        autofocus_config = AutoConfig(**overrides)
-    elif Path("train_settings.toml").exists():
-        with open("train_settings.toml") as config_file:
-            config = from_toml(UserConfig, config_file.read())
-        # merge the config file with CLI args; non-None CLI values win
+    config: CompareUserConfig
+    train_settings = Path(TRAIN_SETTINGS_STR)
+    if train_settings.exists():
+        config = CompareUserConfig.from_toml(train_settings)
+        # merge the config file, by overwriting it with CLI args
         config.merge(
-            paths=Paths(None, None),
-            train=Train(
-                None,
-                batch_size,
-                crop_size,
-                device_user,
-                epoch_count,
-                learning_rate,
-                num_classes,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
             flags=Flags(None, None, None, use_sample_data),
+            paths=Paths.empty(),
+            batch_size=batch_size,
+            crop_size=crop_size,
+            device=device_user,
+            epoch_count=epoch_count,
+            num_classes=num_classes,
+            soft_label_sigma=soft_label_sigma,
         )
-        autofocus_config = config.to_auto_config()
     else:
-        logger.error(
-            "Config file not found, expected 'train_settings.toml' in repo root. Using \
-        default settings."
-        )
-        autofocus_config = AutoConfig()
+        raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
 
-    report = compare_backbones(autofocus_config, backbones=selected, run_training=not skip_train)
+    report = compare_backbones(config.resolve_paths(), backbones=selected)
     console.print(report.to_table())
     report.save()
     report.plot(DisplayType(display))
