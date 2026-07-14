@@ -194,7 +194,6 @@ def init_logging() -> None:
     # pyserde dumps its full generated serializer scope at DEBUG for every
     # @serde class, which bloats the log file and forces constant rollovers.
     logging.getLogger("serde").setLevel(logging.WARNING)
-    # logging.getLogger("typer").setLevel(logging.WARNING)
     # logging.getLogger("click").setLevel(logging.WARNING)
 
     _listener.start()

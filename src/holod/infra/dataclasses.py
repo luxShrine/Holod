@@ -176,7 +176,6 @@ class AutoConfig:
 
     def __post_init__(self):
         """Populate dictionary fields after initialization."""
-        logger.info(f"Training type: {self.analysis}.")
         self.data.update(
             {
                 "analysis": self.analysis,
@@ -268,8 +267,10 @@ class AutoConfig:
         soft_label_sigma: float | None = None,
     ) -> AutoConfig:
         """Parse user input to ensure proper arguments are recieved."""
-        backbone_type = ModelType.from_str(backbone) if backbone is not None else ModelType.ENET
+        analysis = AnalysisType.CLASS if num_classes != 1 else AnalysisType.REG
+        logger.info(f"Training type: {analysis}.")
 
+        backbone_type = ModelType.from_str(backbone) if backbone is not None else ModelType.ENET
         # WARN: not robust for all types, will need a change <05-09-25>
         if backbone_type == ModelType.VIT and crop_size != 224:
             logger.error(
@@ -291,7 +292,7 @@ class AutoConfig:
             raise ValueError(f"soft_label_sigma must be >= 0, got {soft_label_sigma}.")
 
         return cls(
-            analysis=AnalysisType.CLASS if num_classes != 1 else AnalysisType.REG,
+            analysis=analysis,
             backbone=backbone_type,
             batch_size=batch_size,
             checkpoint=checkpoint,
@@ -391,10 +392,11 @@ class CompareUserConfig:
     def resolve_paths(self) -> CompareUserConfig:
         """Resolve the dataset root and metadata CSV into absolute paths.
 
-        Must be called after ``merge`` (so CLI paths are already applied) and before
-        the config is used to load a dataset. Validates that the dataset and CSV
-        exist, prompting the user as needed, and rewrites ``paths`` in-place to the
-        resolved absolute locations. Idempotent: repeated calls are no-ops.
+        Enforced automatically at the end of ``merge`` and at the start of
+        ``to_auto_config``, so a config can never reach dataset loading or training
+        with unresolved paths. Validates that the dataset and CSV exist, prompting
+        the user as needed, and rewrites ``paths`` in-place to the resolved absolute
+        locations. Idempotent: repeated calls are no-ops.
         """
         if self._paths_resolved:
             return self
@@ -465,7 +467,8 @@ class CompareUserConfig:
             self._merge_group(self.paths, paths)
         if flags is not None:
             self._merge_group(self.flags, flags)
-        return self
+        # resolve here so no caller can use a merged config with unresolved paths
+        return self.resolve_paths()
 
     def model_config(self, backbone: ModelType) -> ModelConfig | None:
         """Return the per-model config for a backbone, or ``None`` if unconfigured."""
@@ -508,26 +511,31 @@ class CompareUserConfig:
                 return cls(Paths.empty(), Flags.empty(), vit=model_config)
 
     def to_auto_config(self, backbone: ModelType) -> AutoConfig:
-        """Build the runtime ``AutoConfig`` for one configured backbone."""
-        t_cfg = self.model_config(backbone)
+        """Build the runtime ``AutoConfig`` for one configured backbone.
+
+        Resolves paths first (a no-op if ``merge`` already did), so the returned
+        config always points at a validated dataset.
+        """
+        out = self.resolve_paths()
+        t_cfg = out.model_config(backbone)
         if t_cfg is None:
             raise KeyError(
                 f"Selected backbone: {backbone.value} is not configured, "
-                f"available backbones: {[m.value for m in self.configured_backbones()]}"
+                f"available backbones: {[m.value for m in out.configured_backbones()]}"
             )
         return AutoConfig.from_user(
-            batch_size=self.batch_size,
-            crop_size=self.crop_size,
-            device_user=self.device,
-            epoch_count=self.epoch_count,
-            num_classes=self.num_classes,
-            num_workers=self.num_workers,
-            val_split=self.val_split,
-            soft_label_sigma=self.soft_label_sigma,
+            batch_size=out.batch_size,
+            crop_size=out.crop_size,
+            device_user=out.device,
+            epoch_count=out.epoch_count,
+            num_classes=out.num_classes,
+            num_workers=out.num_workers,
+            val_split=out.val_split,
+            soft_label_sigma=out.soft_label_sigma,
             # paths & flags
-            meta_csv=self.paths.meta_csv_name,
-            checkpoint=self.flags.checkpoint,
-            fixed_seed=self.flags.fixed_seed,
+            meta_csv=out.paths.meta_csv_name,
+            checkpoint=out.flags.checkpoint,
+            fixed_seed=out.flags.fixed_seed,
             # train cfg
             backbone=t_cfg.train.backbone,
             opt_lr=t_cfg.train.learning_rate,
@@ -807,7 +815,7 @@ class ModelCheckpoint:
         )
 
 
-def create_autofocus_model(a_cfg: AutoConfig) -> nn.Module:
+def create_autofocus_model(a_cfg: AutoConfig, quiet: bool = False) -> nn.Module:
     """Create and configure the model."""
     model: nn.Module
     num_model_outputs = 1 if a_cfg.analysis == AnalysisType.REG else a_cfg.num_classes
@@ -830,10 +838,11 @@ def create_autofocus_model(a_cfg: AutoConfig) -> nn.Module:
             )
         case ModelType.FOCUSNET:
             model = FocusNetTorch(num_classes=num_model_outputs)
-    logger.info(
-        f"Model '{a_cfg.backbone.value}' configured with {num_model_outputs} output "
-        + f"features for {a_cfg.analysis.value} analysis."
-    )
+    if not quiet:
+        logger.info(
+            f"Model '{a_cfg.backbone.value}' configured with {num_model_outputs} output "
+            + f"features for {a_cfg.analysis.value} analysis."
+        )
     return model
 
 
@@ -842,7 +851,9 @@ def class_label_transform(z_raw_idx: np.int64) -> Tensor:
     return torch.as_tensor(z_raw_idx, dtype=torch.long)
 
 
-def create_training_setup(base: HologramFocusDataset, a_cfg: AutoConfig) -> CoreTrainer:
+def create_training_setup(
+    base: HologramFocusDataset, a_cfg: AutoConfig, quiet: bool = False
+) -> CoreTrainer:
     """Split the dataset, apply transforms and build dataloaders."""
     (train_subset, eval_subset) = a_cfg.setup_loader_indices(base)
     logger.debug("Train and evaluation subset created successfully")
@@ -905,7 +916,7 @@ def create_training_setup(base: HologramFocusDataset, a_cfg: AutoConfig) -> Core
             loss_fn = nn.CrossEntropyLoss()
     else:
         loss_fn = nn.MSELoss()
-    model = create_autofocus_model(a_cfg)
+    model = create_autofocus_model(a_cfg, quiet)
 
     # optimizer should only be created after model
     optimizer = torch.optim.AdamW(
@@ -936,5 +947,6 @@ def create_training_setup(base: HologramFocusDataset, a_cfg: AutoConfig) -> Core
         z_std=Q_(z_std, u.m),
         z_avg=Q_(z_avg, u.m),
     )
-    logger.info("Hyperparameter Initialization Complete ")
+    if not quiet:
+        logger.info("Training Setup Complete")
     return core_trainer_config

@@ -5,8 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# TODO: change new in enums/text to physics based CNN
-
 
 def physics_informed_loss(loss_fn: Any, prediction: float, label: float):
     # TODO: implement basic idea of being aware of the physics:
@@ -58,25 +56,30 @@ class NeuralNetwork(nn.Module):
 
 
 @torch.no_grad()
-def fft_mag2d(x: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+def fft_mag2d(x: torch.Tensor) -> torch.Tensor:
     """Compute |FFT2| with centered spectrum, per-sample, per-channel.
 
     Args:
         x: (N, C, H, W) real input (hologram).
-        eps: small bias for numerical stability.
 
     Returns:
-        (N, C, H, W) nonnegative magnitude.
+        (N, C, H, W) log-magnitude, per sample normalization.
 
     """
-    # FFT expects complex; cast real -> complex
-    x_c = torch.view_as_complex(torch.stack((x, torch.zeros_like(x)), dim=-1))
-    f = torch.fft.fft2(x_c, dim=(-2, -1), norm="backward")
+    # Remove the per-image mean: the DC coefficient is exactly sum(x),
+    # so subtracting the mean zeroes it out before it can dominate
+    x = x - x.mean(dim=(-2, -1), keepdim=True)
+
+    f = torch.fft.fft2(x, dim=(-2, -1), norm="ortho")  # ortho keeps magnitudes moderate
     f = torch.fft.fftshift(f, dim=(-2, -1))
     mag = torch.abs(f)
-    if eps:
-        mag = mag + eps
-    return mag.real  # still real
+    mag = torch.log1p(mag)  # compress dynamic range
+
+    # per sample normalization so the channel is scaled to
+    # the spatial hologram channel
+    mu = mag.mean(dim=(-2, -1), keepdim=True)
+    std = mag.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    return (mag - mu) / std
 
 
 def make_input_2ch(holod: torch.Tensor, use_fft: bool = True) -> torch.Tensor:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -11,51 +11,30 @@ from torch import Tensor
 
 from holod.infra.dataclasses import (
     Checkpoint,
+    CompareUserConfig,
     CoreTrainer,
     EpochMetric,
     ModelCheckpoint,
+    create_training_setup,
 )
+from holod.infra.dataset import HologramFocusDataset
 from holod.infra.log import get_logger
 from holod.infra.util.paths import checkpoints_loc, report_path
+from holod.infra.util.prog_helper import track_progress
 from holod.infra.util.types import (
     AnalysisType,
     Arr32,
+    ModelType,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = get_logger(__name__)
 
-# how many models to be kept
-MAX_MODEL_HISTORY: int = 20
 EXPECTED_IMPROVEMENT_PERCENT: float = 1e-3
 
 type TrainStatus = TrainImprovement | None
-
-
-def _remove_oldest_checkpoint(path_to_model_detail: Path) -> None:
-    """Remove the oldest checkpoint if max model history is reached."""
-    # get files in out directory
-    files_in_out_dir: list[Path] = list(path_to_model_detail.parent.iterdir())
-    if len(files_in_out_dir) > (MAX_MODEL_HISTORY + 1):
-        # clean up directory if needed to preserve storage
-        # if checkpoint folder has > MAX_MODEL_HISTORY, remove oldest
-        # find files that end in ".pth"
-        file_count_pth: int = 0
-        oldest_mod_time: float = np.inf
-        oldest_file: Path | None = None
-        for out_file in files_in_out_dir:
-            if out_file.as_posix().endswith(".pth"):
-                file_count_pth += 1
-                current_mod_time: float = out_file.stat().st_mtime
-                if current_mod_time < oldest_mod_time:
-                    oldest_file = out_file
-                    oldest_mod_time = current_mod_time
-        # remove oldest_file if limit reached
-        if file_count_pth > MAX_MODEL_HISTORY and oldest_file is not None:
-            logger.debug(
-                f"Max model history limit of {MAX_MODEL_HISTORY} "
-                + f"reached, deleting {oldest_file}"
-            )
-            oldest_file.unlink()
 
 
 @dataclass
@@ -114,18 +93,10 @@ class TrainImprovement:
                     return None
 
         if save_best_model_flag:
-            # convert best_val_metric form of 5 numbers, in scientific notation
-            # create file with name that is unique to evaluation
-            best_model_name: str = (
-                path_to_model.name.removesuffix(".pth") + f"{best_val_out:3e}" + ".pth"
-            )
-            path_to_model_detail = path_to_model.parent / Path(best_model_name)
-
-            # check if files in directory has potential amount of
-            # files to reach limit before loop.
-            _remove_oldest_checkpoint(path_to_model_detail)
+            # overwrite the single best-model file in place; the metric and epoch
+            # are stored inside the checkpoint itself
             checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, best_val_out)
-            checkpoint.torch_save(path_to_model_detail)
+            checkpoint.torch_save(path_to_model)
         return TrainImprovement(best_val_out, save_best_model_flag)
 
 
@@ -244,14 +215,22 @@ def save_loss_to_file(
     return json_p
 
 
-# TODO: setup tests?
+# exercised per-backbone by the slow tests in src/tests/check_overfit.py
 def overfit_single_batch(
     core_trainer: CoreTrainer, n: int = 100, avg_over_w: int = 5, rel_threshold=0.05
 ):
+    """Train on one batch for ``n`` steps to sanity-check model capacity and wiring.
+
+    Returns a dict with the per-step ``losses``, the ``start_avg``/``end_avg`` loss
+    (each averaged over ``avg_over_w`` steps), their ``ratio``, and whether the run
+    counts as an ``overfit`` (ratio at or below ``rel_threshold``). The trainer's
+    model and optimizer are left untouched.
+    """
     loader = core_trainer.train_loader
-    # ensure that if the core_trainer is used after, the model/optimizer are untouched
-    model = deepcopy(core_trainer.model)
-    opt = deepcopy(core_trainer.optimizer)
+    # ensure that if the core_trainer is used after, the model/optimizer are untouched;
+    # copied together so the optimizer copy still points at the copied model's
+    # parameters (separate deepcopies sever that link and step() updates nothing)
+    model, opt = deepcopy((core_trainer.model, core_trainer.optimizer))
     loss_fn = core_trainer.loss_fn
     losses = []
     device = core_trainer.device
@@ -287,3 +266,102 @@ def overfit_single_batch(
         "ratio": ratio,
         "overfit": overfit,
     }
+
+
+def _create_loader_cycle(core_trainer: CoreTrainer):
+    while True:
+        yield from core_trainer.train_loader
+
+
+def determine_learning_rate(
+    u_cfg: CompareUserConfig,
+    backbone: ModelType,
+    *,
+    learning_rate_lower: float = 1e-7,
+    learning_rate_upper: float = 1e-2,
+    n: int = 500,
+    divergence_factor: float = 4.0,
+    beta: float = 0.98,
+):
+    """Sweep ``n`` log-spaced learning rates and report the final-epoch loss for each."""
+    # log-spaced: LR effects span decades, linear spacing would leave the
+    # low decades almost unsampled
+    learning_rates = np.geomspace(learning_rate_lower, learning_rate_upper, num=n)
+    loss_per_each_lr: dict[float, tuple[float, float]] = {}
+
+    _ = torch.manual_seed(42)
+    u_cfg = u_cfg.resolve_paths()
+    analysis = AnalysisType.determine(u_cfg.num_classes)
+    base = HologramFocusDataset(
+        mode=analysis,
+        num_classes=u_cfg.num_classes,
+        csv_file_strpath=u_cfg.paths.meta_csv_name,
+    )
+    a_cfg = u_cfg.to_auto_config(backbone)
+    core_trainer = create_training_setup(base, a_cfg)
+    # identical split and model init for every candidate, so loss differences
+    # reflect the learning rate alone
+    model, opt, loss_fn = core_trainer.model, core_trainer.optimizer, core_trainer.loss_fn
+    device = core_trainer.device
+    model.to(device)
+
+    # zip retrieves tuples until the shortest is exhausted, so no need to
+    # have the loader be the same length as the learning rates
+    loader_cycle = _create_loader_cycle(core_trainer)
+    lr_batches = zip(learning_rates, loader_cycle, strict=False)
+
+    best_smoothed_loss: float = np.inf
+    exp_moving_avg = 0.0  # running average
+
+    for idx, (lr, (x, y)) in enumerate(track_progress(lr_batches, total=n), start=1):
+        # each batch has a new LR
+        for g in opt.param_groups:
+            g["lr"] = lr
+
+        x, y = x.to(device), y.to(device)
+        out = model(x)
+        loss = loss_fn(out, y)
+        loss.backward()
+        loss_current = float(loss.item())
+        exp_moving_avg = (beta * exp_moving_avg) + ((1 - beta) * loss_current)
+        # the above average is setup such that ~=(1-beta)% of the inital loss and
+        # would be passed on to be the best avg loss. Thus, the following iterations
+        # will increase the loss as the previous exp_moving_avg increases from the
+        # initial 0.0. The solution is to temper the moving average based on the number
+        # of iterations
+        smoothed_loss = exp_moving_avg / (1 - (beta**idx))
+        loss_per_each_lr[lr] = (loss_current, smoothed_loss)
+
+        opt.step()
+        opt.zero_grad()
+
+        if best_smoothed_loss > smoothed_loss:
+            best_smoothed_loss = smoothed_loss
+        elif not np.isfinite(loss_current) or (
+            smoothed_loss > (divergence_factor * best_smoothed_loss)
+        ):
+            print(f"LR {lr} diverged (loss {loss_current} vs best {best_smoothed_loss}), skipping")
+            break
+
+    # compute the curve of the learning rate loss curve, desired region
+    # should be on a downward slope, negative derivative
+    diff = np.diff([sl for (_l, sl) in loss_per_each_lr.values()])
+    diff = np.insert(diff, 0, np.inf)  # pad the start such that indices line up
+    for idx, ((lr, (m_loss, s_loss)), c_diff) in enumerate(
+        zip(loss_per_each_lr.items(), diff, strict=False)
+    ):
+        if (idx % 100) == 0:
+            print(
+                f"For learning rate: {lr:.6e}, corresponding loss: {m_loss:.6e}, "
+                + f"smoothed loss: {s_loss:.6e}, corresponding diff: {c_diff:.6e}"
+            )
+    ideal_lr_idx = np.argmin(diff)
+    ideal_lr = learning_rates[ideal_lr_idx]
+    ideal_lr_loss, ideal_lr_s_loss = loss_per_each_lr[ideal_lr]
+    ideal_lr_diff = diff[ideal_lr_idx]
+    print(
+        f"Reccomended learning rate: {ideal_lr:.6e}, corresponding loss: {ideal_lr_loss:.6e}, "
+        + f"smoothed loss: {ideal_lr_s_loss:.6e}, corresponding diff: {ideal_lr_diff:.6e}"
+    )
+
+    return loss_per_each_lr, ideal_lr

@@ -90,6 +90,15 @@ def checkpoints_loc() -> Path:
     return check
 
 
+def latest_epoch_checkpoint(backbone_name: str) -> Path | None:
+    """Return the newest labeled epoch checkpoint for a backbone, or ``None`` if absent."""
+    candidates = sorted(
+        checkpoints_loc().glob(f"checkpoint_{backbone_name}_epoch*.tar"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    return candidates[-1] if candidates else None
+
+
 def t_loc() -> Path:
     """Return path to the directory containing the tests (src/tests)."""
     return src_root() / "tests"

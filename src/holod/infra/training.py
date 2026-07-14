@@ -269,8 +269,9 @@ def train_eval_epoch(
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     val_metric_name = "accuracy" if core_trainer.analysis == AnalysisType.CLASS else "mae_mm"
 
-    path_to_checkpoint: Path = checkpoint_dir / Path("latest_checkpoint.tar")
-    path_to_model: Path = checkpoint_dir / Path(f"checkpoint_{core_trainer.backbone.name}.pth")
+    # two files per backbone: the best model (overwritten on improvement) and the
+    # latest epoch (labeled with its epoch number; the previous epoch's file is removed)
+    path_to_model: Path = checkpoint_dir / Path(f"checkpoint_{core_trainer.backbone.name}_best.pth")
     # querying the CUDA device name raises on CPU-only hosts (e.g. a Colab CPU runtime)
     device_name = torch.cuda.get_device_name() if core_trainer.device == "cuda" else "cpu"
     progress_bar, train_task, val_task, epoch_task = setup_training_progress(
@@ -319,7 +320,14 @@ def train_eval_epoch(
                 avg_loss_train,
                 avg_loss_val,
             )
+            path_to_checkpoint: Path = checkpoint_dir / Path(
+                f"checkpoint_{core_trainer.backbone.name}_epoch{epoch:03d}.tar"
+            )
             model_checkpoint.torch_save(path_to_checkpoint)
+            # drop earlier epoch checkpoints so only the latest labeled one remains
+            for stale in checkpoint_dir.glob(f"checkpoint_{core_trainer.backbone.name}_epoch*.tar"):
+                if stale != path_to_checkpoint:
+                    stale.unlink()
             _ = save_loss_to_file(
                 core_trainer.backbone.name,
                 run_stamp,

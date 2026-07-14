@@ -402,8 +402,8 @@ def compare_backbones(
     """Compare backbones under one shared config, training each with its own model config.
 
     Args:
-        u_cfg: Shared configuration plus the per-model sections; its paths must be
-            resolved (``resolve_paths``) before calling.
+        u_cfg: Shared configuration plus the per-model sections; paths are
+            resolved here (``resolve_paths`` is idempotent) before any use.
         backbones: Which backbones to compare; ``None`` compares every backbone
             configured in ``u_cfg``.
 
@@ -413,7 +413,7 @@ def compare_backbones(
         the remaining runs.
 
     """
-    _ = u_cfg.resolve_paths()  # no-op when the CLI already resolved
+    u_cfg = u_cfg.resolve_paths()
     chosen = u_cfg.configured_backbones() if backbones is None else list(backbones)
     device = UserDevice.determine(u_cfg.device)
     analysis = AnalysisType.determine(u_cfg.num_classes)
@@ -665,7 +665,7 @@ def _load_checkpoint_model(
     """Rebuild an eval-mode model from a saved ``Checkpoint``/``ModelCheckpoint`` file."""
     with torch.serialization.safe_globals(ModelCheckpoint.SAFE_GLOBALS):
         torch_dict: dict[str, Any] = torch.load(ckpt_path, weights_only=True, map_location=device)
-    # best-model .pth files hold a flat Checkpoint dict; latest_checkpoint.tar nests it
+    # best-model .pth files hold a flat Checkpoint dict; epoch .tar checkpoints nest it
     ckpt = Checkpoint.from_dict(torch_dict.get("checkpoint", torch_dict))
     a_cfg = AutoConfig.default(
         analysis=AnalysisType.REG if ckpt.bin_centers is None else AnalysisType.CLASS,

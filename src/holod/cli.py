@@ -4,10 +4,17 @@ from typing import TYPE_CHECKING, Any
 
 import click
 import numpy.typing as npt
+from click.core import ParameterSource
 
 from holod.infra.dataclasses import CompareUserConfig
 from holod.infra.log import get_logger, init_logging
-from holod.infra.util.paths import checkpoints_loc, data_spec, path_check, report_path
+from holod.infra.util.paths import (
+    checkpoints_loc,
+    data_spec,
+    latest_epoch_checkpoint,
+    path_check,
+    report_path,
+)
 from holod.infra.util.types import ModelType
 
 if TYPE_CHECKING:
@@ -19,6 +26,32 @@ logger = get_logger(__name__)
 TRAIN_SETTINGS_STR = "train_settings.toml"
 
 
+def _cli_overrides(**values: Any) -> dict[str, Any]:
+    """Return only the options the user explicitly set on the command line.
+
+    Keys must match the Click parameter names. Options left at their CLI
+    default are dropped, so the defaults shown in ``--help`` never clobber
+    values from train_settings.toml.
+    """
+    ctx = click.get_current_context()
+    return {
+        name: value
+        for name, value in values.items()
+        if ctx.get_parameter_source(name) != ParameterSource.DEFAULT
+    }
+
+
+def _resume_checkpoint(selected: ModelType) -> str | None:
+    """Return the latest epoch checkpoint for a backbone, or ``None`` to start fresh."""
+    latest_ckpt = latest_epoch_checkpoint(selected.name)
+    if latest_ckpt is not None:
+        return latest_ckpt.as_posix()
+    logger.warning(
+        f"No epoch checkpoint found for {selected.name} in {checkpoints_loc()}, starting fresh."
+    )
+    return None
+
+
 @click.group()
 def cli():
     """Entry point for the command line interface."""
@@ -26,18 +59,19 @@ def cli():
 
 
 @cli.command()
-@click.argument("ds_root", required=False, default=None, type=click.Path(file_okay=False))
+@click.argument("ds_root", required=False, default="", type=click.Path(file_okay=False))
 @click.option(
     "--csv-name",
     "meta_csv_name",
-    default=None,
+    default="",
     type=click.Path(dir_okay=False),
     help="Path to the metadata CSV file.",
 )
 @click.option(
     "--bins",
     "num_classes",
-    default=None,
+    default=10,
+    show_default=True,
     type=click.IntRange(1, 100),
     help="Number of classifications, set to 1 for regression training.",
 )
@@ -45,84 +79,112 @@ def cli():
     "--model",
     "backbone",
     default="efficientnet",
+    show_default=True,
     type=click.Choice(["efficientnet", "vit", "resnet50", "focusnet", "pcnn"]),
     help="Model backbone name.",
 )
 @click.option(
     "--crop",
     "crop_size",
-    default=None,
+    default=224,
+    show_default=True,
     type=click.IntRange(20, 516),
     help="Size to crop images to.",
 )
 @click.option(
     "--split",
     "val_split",
-    default=None,
+    default=0.2,
+    show_default=True,
     type=click.FloatRange(0.001, 1),
     help="Fraction of data for validation.",
 )
 @click.option(
     "--batch",
     "batch_size",
-    default=None,
+    default=16,
+    show_default=True,
     type=click.IntRange(1, 64),
     help="Training batch size.",
 )
 @click.option(
     "--ep",
     "epoch_count",
-    default=None,
+    default=10,
+    show_default=True,
     type=click.IntRange(1, 1000),
     help="Number of training epochs.",
 )
 @click.option(
     "--lr",
     "learning_rate",
-    default=None,
+    default=5e-5,
+    show_default=True,
     type=click.FloatRange(1e-6, 1e2),
     help="How fast should the model adapt epoch to epoch",
 )
 @click.option(
     "--device",
-    "device_user",
-    default=None,
+    default="cuda",
+    show_default=True,
     type=click.Choice(["cuda", "cpu"]),
     help="Device for training.",
 )
 @click.option(
     "--soft-sigma",
     "soft_label_sigma",
-    default=None,
+    default=0.0,
+    show_default=True,
     type=click.FloatRange(0.0, 100.0),
     help="Std dev (in bins) for soft ordinal classification labels; 0 keeps hard labels.",
 )
-@click.option("--fixed-seed", "fixed_seed", default=None, help="Keep the random seed consistent.")
+@click.option(
+    "--fixed-seed/--no-fixed-seed",
+    "fixed_seed",
+    default=True,
+    show_default=True,
+    help="Keep the random seed consistent.",
+)
 @click.option(
     "--continue",
-    "continue_train",
+    "checkpoint",
     is_flag=True,
-    default=None,
+    default=False,
+    show_default=True,
     help="Continue from checkpoint",
 )
-@click.option("--create-csv", "create_csv", default=None, help="Create a CSV for data.")
-@click.option("--sample", "use_sample_data", default=None, help="Use sample data provided.")
+@click.option(
+    "--create-csv",
+    "create_csv",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Create a CSV for data.",
+)
+@click.option(
+    "--sample",
+    "sample",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Use sample data provided.",
+)
 def train(
-    ds_root: str | None,
-    meta_csv_name: str | None,
-    num_classes: int | None,
+    ds_root: str,
+    meta_csv_name: str,
+    num_classes: int,
     backbone: str,
-    crop_size: int | None,
-    val_split: float | None,
-    batch_size: int | None,
-    epoch_count: int | None,
-    learning_rate: float | None,
-    device_user: str | None,
-    soft_label_sigma: float | None,
-    fixed_seed: bool | None,
-    continue_train: bool | None,
-    create_csv: bool | None,
-    use_sample_data: bool | None,
+    crop_size: int,
+    val_split: float,
+    batch_size: int,
+    epoch_count: int,
+    learning_rate: float,
+    device: str,
+    soft_label_sigma: float,
+    fixed_seed: bool,
+    checkpoint: bool,
+    create_csv: bool,
+    sample: bool,
 ) -> None:
     """Train the autofocus model based on supplied dataset.
 
@@ -141,39 +203,43 @@ def train(
 
     autofocus_config: AutoConfig
     path_ckpt: str | None = None
-    ds_root = ds_root if ds_root is not None else ""
-    meta_csv_name = meta_csv_name if meta_csv_name is not None else ""
     train_settings = Path(TRAIN_SETTINGS_STR)
     selected = ModelType.from_str(backbone)
     if train_settings.exists():
         config = CompareUserConfig.from_toml(train_settings)
-        # merge the config file, by overwriting it with CLI args
+        # config-file values are the base; only options the user explicitly
+        # passed on the command line override them
         config.merge(
-            flags=Flags(None, create_csv, fixed_seed, use_sample_data),
+            flags=Flags(
+                **_cli_overrides(
+                    checkpoint=checkpoint,
+                    create_csv=create_csv,
+                    fixed_seed=fixed_seed,
+                    sample=sample,
+                )
+            ),
             paths=Paths(ds_root, meta_csv_name),
-            batch_size=batch_size,
-            crop_size=crop_size,
-            device=device_user,
-            epoch_count=epoch_count,
-            val_split=val_split,
-            num_classes=num_classes,
-            soft_label_sigma=soft_label_sigma,
+            **_cli_overrides(
+                batch_size=batch_size,
+                crop_size=crop_size,
+                device=device,
+                epoch_count=epoch_count,
+                val_split=val_split,
+                num_classes=num_classes,
+                soft_label_sigma=soft_label_sigma,
+            ),
         )
-        if (config.flags.checkpoint or continue_train) is True:
-            latest_ckpt = checkpoints_loc() / "latest_checkpoint.tar"
-            if latest_ckpt.exists():
-                path_ckpt = latest_ckpt.as_posix()
-            else:
-                logger.warning(f"No checkpoint found at {latest_ckpt}, starting fresh.")
+        if config.flags.checkpoint:
+            path_ckpt = _resume_checkpoint(selected)
         # --lr targets the selected model's config, since learning rate is per-model now
         model_config = config.model_config(selected)
-        if learning_rate is not None and model_config is not None:
+        if model_config is not None and _cli_overrides(learning_rate=learning_rate):
             model_config.train.learning_rate = learning_rate
-        autofocus_config = config.resolve_paths().to_auto_config(selected)
+        autofocus_config = config.to_auto_config(selected)
 
     elif ds_root != "":
         # no config file, but a dataset was supplied on the CLI: build the config
-        # purely from CLI arguments so external dataset folders still work
+        # purely from CLI arguments (including their defaults)
         logger.warning("Config file 'train_settings.toml' not found, using CLI arguments only.")
         model_config = ModelConfig(
             train=Train(
@@ -186,23 +252,19 @@ def train(
         )
         config = CompareUserConfig.from_model_config(model_config)
         config = config.merge(
-            flags=Flags(None, create_csv, fixed_seed, use_sample_data),
+            flags=Flags(checkpoint, create_csv, fixed_seed, sample),
             paths=Paths(ds_root, meta_csv_name),
             batch_size=batch_size,
             crop_size=crop_size,
-            device=device_user,
+            device=device,
             epoch_count=epoch_count,
             val_split=val_split,
             num_classes=num_classes,
             soft_label_sigma=soft_label_sigma,
         )
-        if continue_train is True:
-            latest_ckpt = checkpoints_loc() / "latest_checkpoint.tar"
-            if latest_ckpt.exists():
-                path_ckpt = latest_ckpt.as_posix()
-            else:
-                logger.warning(f"No checkpoint found at {latest_ckpt}, starting fresh.")
-        autofocus_config = config.resolve_paths().to_auto_config(selected)
+        if checkpoint:
+            path_ckpt = _resume_checkpoint(selected)
+        autofocus_config = config.to_auto_config(selected)
 
     else:
         raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
@@ -222,61 +284,74 @@ def train(
 @click.option(
     "--bins",
     "num_classes",
-    default=None,
+    default=10,
+    show_default=True,
     type=click.IntRange(1, 100),
     help="Number of classifications, set to 1 for regression training.",
 )
 @click.option(
     "--crop",
     "crop_size",
-    default=None,
+    default=224,
+    show_default=True,
     type=click.IntRange(20, 516),
     help="Size to crop images to.",
 )
 @click.option(
     "--batch",
     "batch_size",
-    default=None,
+    default=16,
+    show_default=True,
     type=click.IntRange(1, 64),
     help="Training batch size.",
 )
 @click.option(
     "--ep",
     "epoch_count",
-    default=None,
+    default=10,
+    show_default=True,
     type=click.IntRange(1, 1000),
     help="Number of training epochs per backbone.",
 )
 @click.option(
     "--device",
-    "device_user",
-    default=None,
+    default="cuda",
+    show_default=True,
     type=click.Choice(["cuda", "cpu"]),
     help="Device for training.",
 )
 @click.option(
     "--soft-sigma",
     "soft_label_sigma",
-    default=None,
+    default=0.0,
+    show_default=True,
     type=click.FloatRange(0.0, 100.0),
     help="Std dev (in bins) for soft ordinal classification labels; 0 keeps hard labels.",
 )
-@click.option("--sample", "use_sample_data", default=None, help="Use sample data provided.")
+@click.option(
+    "--sample",
+    "sample",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Use sample data provided.",
+)
 @click.option(
     "--display",
     default="save",
+    show_default=True,
     type=click.Choice(["save", "show", "both"]),
     help="Save the backbone-comparison plot, show it, or both.",
 )
 def compare(
     models: tuple[str, ...],
-    num_classes: int | None,
-    crop_size: int | None,
-    batch_size: int | None,
-    epoch_count: int | None,
-    device_user: str | None,
-    soft_label_sigma: float | None,
-    use_sample_data: bool | None,
+    num_classes: int,
+    crop_size: int,
+    batch_size: int,
+    epoch_count: int,
+    device: str,
+    soft_label_sigma: float,
+    sample: bool,
     display: str,
 ) -> None:
     """Compare each configured model backbone under the shared configuration."""
@@ -291,21 +366,24 @@ def compare(
     train_settings = Path(TRAIN_SETTINGS_STR)
     if train_settings.exists():
         config = CompareUserConfig.from_toml(train_settings)
-        # merge the config file, by overwriting it with CLI args
+        # config-file values are the base; only options the user explicitly
+        # passed on the command line override them
         config.merge(
-            flags=Flags(None, None, None, use_sample_data),
+            flags=Flags(**_cli_overrides(sample=sample)),
             paths=Paths.empty(),
-            batch_size=batch_size,
-            crop_size=crop_size,
-            device=device_user,
-            epoch_count=epoch_count,
-            num_classes=num_classes,
-            soft_label_sigma=soft_label_sigma,
+            **_cli_overrides(
+                batch_size=batch_size,
+                crop_size=crop_size,
+                device=device,
+                epoch_count=epoch_count,
+                num_classes=num_classes,
+                soft_label_sigma=soft_label_sigma,
+            ),
         )
     else:
         raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
 
-    report = compare_backbones(config.resolve_paths(), backbones=selected)
+    report = compare_backbones(config, backbones=selected)
     console.print(report.to_table())
     report.save()
     report.plot(DisplayType(display))
@@ -323,15 +401,29 @@ def compare(
 @click.option(
     "--runs",
     default=5,
+    show_default=True,
     type=click.IntRange(1, 1000),
     help="Repeated predictions to time per model.",
 )
-@click.option("--crop_size", default=224, help="Pixel width and height to center-crop input to")
 @click.option(
-    "--wavelength", default=530e-9, help="Wavelength of light used to capture the image (m)"
+    "--crop_size",
+    default=224,
+    show_default=True,
+    help="Pixel width and height to center-crop input to",
+)
+@click.option(
+    "--wavelength",
+    default=530e-9,
+    show_default=True,
+    help="Wavelength of light used to capture the image (m)",
 )
 # default matches SENSOR_PIXEL_PITCH_M (kept literal here: heavy types import stays lazy)
-@click.option("--dx", default=3.8e-6, help="Pixel pitch of the capture sensor (m)")
+@click.option(
+    "--dx",
+    default=3.8e-6,
+    show_default=True,
+    help="Pixel pitch of the capture sensor (m)",
+)
 @click.option(
     "--z-true",
     "z_true_mm",
@@ -349,13 +441,15 @@ def compare(
 )
 @click.option(
     "--device",
-    default=None,
-    type=click.Choice(["cuda", "cpu"]),
-    help="Device for evaluation.",
+    default="auto",
+    show_default=True,
+    type=click.Choice(["auto", "cuda", "cpu"]),
+    help="Device for evaluation; 'auto' picks CUDA when available.",
 )
 @click.option(
     "--display",
     default="save",
+    show_default=True,
     type=click.Choice(["save", "show", "both"]),
     help="Save the depth-prediction plot, show it, or both.",
 )
@@ -368,7 +462,7 @@ def compare_holo(
     dx: float,
     z_true_mm: float | None,
     l_mm: float | None,
-    device: str | None,
+    device: str,
     display: str,
 ) -> None:
     """Run comparison test evaluations of trained models on a single hologram."""
@@ -394,7 +488,7 @@ def compare_holo(
         dx=dx,
         z_true_mm=z_true_mm,
         l_mm=l_mm,
-        device=device,
+        device=None if device == "auto" else device,
     )
     console.print(report.to_table())
     report.save()
@@ -402,8 +496,13 @@ def compare_holo(
 
 
 @cli.command()
-# TODO: make this utilize a proper enum, not true/false <luxShrine>
-@click.option("--display", default="save", help="Save the output plots, show them, or both.")
+@click.option(
+    "--display",
+    default="save",
+    show_default=True,
+    type=click.Choice(["save", "show", "both", "meta"]),
+    help="Save the output plots, show them, both, or write plot metadata only.",
+)
 def plot_train(
     display: str,
 ):
@@ -453,17 +552,33 @@ def plot_train(
 @click.option(
     "--model_path",
     default="best_model.pth",
+    show_default=True,
     help="Path to trained model to use for torch optics analysis",
 )
-@click.option("--crop_size", default=512, help="Pixel width and height of image")
 @click.option(
-    "--wavelength", default=530e-9, help="Wavelength of light used to capture the image (m)"
+    "--crop_size",
+    default=512,
+    show_default=True,
+    help="Pixel width and height of image",
+)
+@click.option(
+    "--wavelength",
+    default=530e-9,
+    show_default=True,
+    help="Wavelength of light used to capture the image (m)",
 )
 # default matches SENSOR_PIXEL_PITCH_M (kept literal here: heavy types import stays lazy)
-@click.option("--dx", default=3.8e-6, help="Pixel pitch of the capture sensor (m)")
+@click.option(
+    "--dx",
+    default=3.8e-6,
+    show_default=True,
+    help="Pixel pitch of the capture sensor (m)",
+)
 @click.option(
     "--display",
     default="save",
+    show_default=True,
+    type=click.Choice(["save", "show", "both"]),
     help="Show, Save or do both for resulting phase and amplitude images",
 )
 def reconstruction(
@@ -542,6 +657,129 @@ def reconstruction(
             amp_true=amp_true,
             phase_true=phase_true,
         )
+
+
+@cli.command()
+@click.argument("ds_root", required=False, default="", type=click.Path(file_okay=False))
+@click.option(
+    "--csv-name",
+    "meta_csv_name",
+    default="",
+    type=click.Path(dir_okay=False),
+    help="Path to the metadata CSV file.",
+)
+@click.option(
+    "--bins",
+    "num_classes",
+    default=10,
+    show_default=True,
+    type=click.IntRange(1, 100),
+    help="Number of classifications, set to 1 for regression training.",
+)
+@click.option(
+    "--model",
+    "backbone",
+    default="efficientnet",
+    show_default=True,
+    type=click.Choice(["efficientnet", "vit", "resnet50", "focusnet", "pcnn"]),
+    help="Model backbone name.",
+)
+@click.option(
+    "--crop",
+    "crop_size",
+    default=224,
+    show_default=True,
+    type=click.IntRange(20, 516),
+    help="Size to crop images to.",
+)
+@click.option(
+    "--split",
+    "val_split",
+    default=0.2,
+    show_default=True,
+    type=click.FloatRange(0.001, 1),
+    help="Fraction of data for validation.",
+)
+@click.option(
+    "--batch",
+    "batch_size",
+    default=16,
+    show_default=True,
+    type=click.IntRange(1, 64),
+    help="Training batch size.",
+)
+@click.option(
+    "--device",
+    default="cuda",
+    show_default=True,
+    type=click.Choice(["cuda", "cpu"]),
+    help="Device for training.",
+)
+@click.option(
+    "--soft-sigma",
+    "soft_label_sigma",
+    default=0.0,
+    show_default=True,
+    type=click.FloatRange(0.0, 100.0),
+    help="Std dev (in bins) for soft ordinal classification labels; 0 keeps hard labels.",
+)
+@click.option(
+    "--create-csv",
+    "create_csv",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Create a CSV for data.",
+)
+@click.option(
+    "--sample",
+    "sample",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Use sample data provided.",
+)
+def determine_lr(
+    ds_root: str,
+    meta_csv_name: str,
+    num_classes: int,
+    backbone: str,
+    crop_size: int,
+    val_split: float,
+    batch_size: int,
+    device: str,
+    soft_label_sigma: float,
+    create_csv: bool,
+    sample: bool,
+) -> None:
+    """Report the performance of a model across various learning rates."""
+    from holod.infra.dataclasses import Flags, Paths
+    from holod.infra.util.training_help import determine_learning_rate
+
+    train_settings = Path(TRAIN_SETTINGS_STR)
+    selected = ModelType.from_str(backbone)
+    if train_settings.exists():
+        config = CompareUserConfig.from_toml(train_settings)
+        # config-file values are the base; only options the user explicitly
+        # passed on the command line override them
+        flags = Flags(**_cli_overrides(create_csv=create_csv, sample=sample))
+        flags.fixed_seed = True  # LR sweeps always use a fixed seed for comparability
+        config.merge(
+            flags=flags,
+            paths=Paths(ds_root, meta_csv_name),
+            **_cli_overrides(
+                batch_size=batch_size,
+                crop_size=crop_size,
+                device=device,
+                val_split=val_split,
+                num_classes=num_classes,
+                soft_label_sigma=soft_label_sigma,
+            ),
+        )
+    else:
+        raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
+
+    _learning_rate_report = determine_learning_rate(config, selected)
 
 
 cli.add_command(train)

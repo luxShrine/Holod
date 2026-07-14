@@ -124,6 +124,11 @@ include = ["src/holod"]
 reportExplicitAny = "none"
 reportCallInDefaultInitializer = "none"
 
+[tool.pytest.ini_options]
+markers = [
+  "slow: long-running tests (e.g. single-batch overfit training); deselect with -m \"not slow\"",
+]
+
 [dependency-groups]
 dev = [
   "line-profiler>=4.2",

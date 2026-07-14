@@ -282,14 +282,18 @@ def test_backbone_static_stats():
 
 
 def test_compare_config_mapping():
-    """Per-model TOML sections must map onto the selected backbone's AutoConfig."""
+    """Per-model TOML sections must map onto the selected backbone's AutoConfig.
+
+    ``to_auto_config`` enforces path resolution, so the config opts into the
+    bundled sample data to keep resolution prompt-free.
+    """
     import pytest
 
     from holod.infra.dataclasses import CompareUserConfig, Flags, ModelConfig, Paths, Train
 
     cfg = CompareUserConfig(
         paths=Paths.empty(),
-        flags=Flags.empty(),
+        flags=Flags(checkpoint=False, create_csv=False, fixed_seed=True, sample=True),
         num_classes=5,
         crop_size=64,
         device="cpu",

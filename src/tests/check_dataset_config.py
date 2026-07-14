@@ -230,12 +230,19 @@ def test_regression_analysis(monkeypatch: pytest.MonkeyPatch):
     assert cfg.to_auto_config(ModelType.ENET).analysis == AnalysisType.REG
 
 
-def test_merge_keeps_config_paths_when_cli_unset():
-    """Empty CLI path strings must not clobber values from the config file."""
-    cfg = build_config(paths=Paths("some_ds", "meta.csv"))
+def test_merge_keeps_config_paths_when_cli_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Empty CLI path strings must not clobber values from the config file.
+
+    ``merge`` resolves paths on exit; if the empty CLI paths clobbered the
+    config-file dataset, resolution would prompt (banned here) instead of
+    resolving to the config-file dataset's CSV.
+    """
+    csv_path = make_external_dataset(tmp_path / "ds")
+    _ban_user_prompts(monkeypatch)
+    cfg = build_config(paths=Paths(str(tmp_path / "ds"), CSV_NAME))
     _ = cfg.merge(paths=Paths.empty(), flags=Flags.empty(), batch_size=8)
-    assert cfg.paths.dataset_root == "some_ds"
-    assert cfg.paths.meta_csv_name == "meta.csv"
+    assert cfg.paths.dataset_root == (tmp_path / "ds").as_posix()
+    assert cfg.paths.meta_csv_name == csv_path.as_posix()
     assert cfg.batch_size == 8
 
 

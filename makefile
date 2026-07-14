@@ -8,7 +8,7 @@ PYTHON_INTERPRETER := python
 
 # Directories
 SRC_DIR      := src
-TESTS     	 := $(SRC_DIR)/tests/check_training.py $(SRC_DIR)/tests/check_dataset_config.py
+TESTS     	 := $(SRC_DIR)/tests/check_training.py $(SRC_DIR)/tests/check_dataset_config.py $(SRC_DIR)/tests/check_overfit.py
 BUILD_DIRS   := build dist .pytest_cache .ruff_cache .mypy_cache .coverage htmlcov
 
 #################################################################################
@@ -55,10 +55,15 @@ format:
 typecheck:
 	uv run mypy $(SRC_DIR) || true
 
-## Run tests
+## Run tests (skips slow training tests)
 .PHONY: test
 test:
-	uv run pytest -q $(TESTS)
+	uv run pytest -q --show-capture=stdout -m "not slow" $(TESTS)
+
+## Run slow tests (single-batch overfit per backbone)
+.PHONY: test-slow
+test-slow:
+	uv run pytest -q -m slow $(TESTS)
 
 ## Run tests with coverage HTML report
 .PHONY: coverage
