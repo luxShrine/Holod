@@ -169,6 +169,8 @@ class AutoConfig:
     soft_label_sigma: float = 0.0
     fixed_seed: bool = True
     checkpoint: bool = False
+    # re-enable the pre-fix RandomResizedCrop training augmentation (ablation runs only)
+    legacy_random_crop: bool = False
 
     # Use default_factory for mutable fields and populate in __post_init__
     data: dict[str, Any] = field(default_factory=dict)
@@ -882,6 +884,7 @@ def create_training_setup(
         crop_size=a_cfg.crop_size,
         final_label_transform=final_label_transform,
         model=a_cfg.backbone,
+        legacy_random_crop=a_cfg.legacy_random_crop,
     )
 
     # dataset needs to be iterable in terms of pytorch, dataloader does such

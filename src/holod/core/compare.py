@@ -464,6 +464,10 @@ class HologramEval:
     # gradient-Tamura sharpness of the reconstruction at z_pred; higher is sharper
     # (see focus_score in core/optics/reconstruction.py)
     focus_tc: float | None = None
+    # sharpness of the reconstruction at the *raw* predicted depth, without the
+    # magnification correction — what the pre-fix evaluation measured; populated
+    # only when the source->screen distance L is known
+    focus_tc_uncorrected: float | None = None
     abs_error_mm: float | None = None
     # signed prediction error (positive = overshoot); exposes systematic bias
     signed_error_mm: float | None = None
@@ -744,17 +748,23 @@ def evaluate_checkpoint_on_hologram(
     dx: float,
     z_true_mm: float | None,
     l_mm: float | None = None,
+    preloaded: tuple[nn.Module, AutoConfig, Checkpoint] | None = None,
 ) -> HologramEval:
     """Evaluate one checkpoint on a hologram, timing ``runs`` repeated predictions.
 
     The predicted depth is scored label-free with ``focus_score`` (gradient-Tamura
     sharpness of the reconstruction; higher is sharper). When the DLHM source->screen
     distance ``l_mm`` is known, the reconstruction is done at the plane-wave-equivalent
-    depth ``dlhm_effective_z_mm(z_pred, l_mm)``   without it the raw predicted depth is
-    used, which does not refocus DLHM holograms and makes the score uninformative.
+    depth ``dlhm_effective_z_mm(z_pred, l_mm)`` — without it the raw predicted depth is
+    used, which does not refocus DLHM holograms and makes the score uninformative —
+    and the raw-depth score is additionally recorded as ``focus_tc_uncorrected``.
+    Pass ``preloaded`` to reuse an already-loaded model when scoring many holograms
+    against the same checkpoint.
     """
     entry = HologramEval(model_name=ckpt_path.name, runs=runs)
-    (model, cfg, ckpt) = _load_checkpoint_model(ckpt_path, device)
+    (model, cfg, ckpt) = (
+        preloaded if preloaded is not None else _load_checkpoint_model(ckpt_path, device)
+    )
     entry.backbone = cfg.backbone.value
     entry.analysis = cfg.analysis.value
     entry.num_classes = cfg.num_classes
@@ -775,6 +785,14 @@ def evaluate_checkpoint_on_hologram(
     intensity = np.asarray(pil_image.convert("L"), np.float32) / 255.0
     z_recon_mm = dlhm_effective_z_mm(z_pred_mm, l_mm) if l_mm is not None else z_pred_mm
     entry.focus_tc = focus_score(intensity, wavelength, z_recon_mm * 1e-3, dx)
+    if l_mm is not None:
+        # score the raw depth too (the pre-fix behavior); reuse the corrected value
+        # when the degenerate-geometry fallback made both depths identical
+        entry.focus_tc_uncorrected = (
+            entry.focus_tc
+            if z_recon_mm == z_pred_mm
+            else focus_score(intensity, wavelength, z_pred_mm * 1e-3, dx)
+        )
     if z_true_mm is not None:
         entry.abs_error_mm = abs(z_pred_mm - z_true_mm)
         entry.signed_error_mm = z_pred_mm - z_true_mm

@@ -303,6 +303,7 @@ class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
         crop_size: int,
         final_label_transform: v2.Lambda,
         model: ModelType,
+        legacy_random_crop: bool = False,
     ):
         """Construct a tuple of transformed datasets from subsets."""
         rgb_models = [ModelType.ENET, ModelType.RESNET, ModelType.VIT]
@@ -312,11 +313,14 @@ class TransformedDataset(Dataset[tuple[ImageType, np.float64]]):
 
         # TODO: evaluate implementing extra transforms
         extra_tf: list[nn.Module] = [
-            # crop random area
             # flip image with some probability
             v2.RandomHorizontalFlip(p=0.5),
             v2.RandomVerticalFlip(p=0.5),
         ]
+        if legacy_random_crop:
+            # pre-fix behavior for ablation runs: random scaled crop before the flips
+            logger.info("Legacy [bold]RandomResizedCrop[/bold] augmentation enabled (ablation).")
+            extra_tf.insert(0, v2.RandomResizedCrop(size=crop_size, antialias=True))
 
         common_tf: list[nn.Module] = [
             # convert PIL to tensor

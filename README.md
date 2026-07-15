@@ -7,6 +7,7 @@ Holod (package name **`holod`**) provides a command-line interface for training,
 - **Autofocus model training**: Classification or regression backbones (`efficientnet`, `vit`, `resnet50`, `focusnet`, and others) built with PyTorch.
 - **Visualization utilities**: Plot depth‐prediction performance and generate publication-ready figures.
 - **Hologram reconstruction**: Reconstruct amplitude and phase images using a trained model’s predicted depth.
+- **Model comparison**: Benchmark backbones under one shared config (`compare`) or rank trained checkpoints on a single hologram (`compare-holo`) using the label-free gradient‑Tamura focus score — the sharpness of the reconstruction at the predicted depth.
 - **Rich logging**: JSON log file and colorized console output.
 - **Dataset tooling**: Generate metadata CSV files from `info.txt` descriptions and validate images.
 
@@ -97,6 +98,9 @@ Key options:
 
 `--device [cuda|cpu]`
 
+`--soft-sigma FLOAT` – std dev (in bins) for soft ordinal classification labels
+(SORD); 0 keeps hard one-hot labels
+
 `--fixed-seed/--no-fixed-seed` – deterministic training
 
 `--continue` – resume from a checkpoint
@@ -113,29 +117,32 @@ holod train src/data/MW_Dataset_Sample --bins 10 --crop 256 --ep 8 --lr 1e-4
 
 `compare`
 
-Compare model backbones under one shared configuration. Collects architecture
-statistics (parameter counts, tensor size, input channels), inference speed
-(latency and throughput), and   unless `--skip-train` is passed   trains each
-backbone with the standard pipeline and reports its losses and best validation
-metric (accuracy for classification, MAE for regression). Results are printed
-as a table and saved to `reports/backbone_comparison_<timestamp>.{json,csv}`.
-Each trained backbone also writes the same per-run artifacts an individual
-`train` run produces: best-model checkpoints in `src/checkpoints`, a per-epoch
-loss/metric history in `reports/loss/`, and a `reports/plot_info_*.json` with
-its per-sample predictions (usable with `plot-train`).
+Compare model backbones under the shared configuration from
+`train_settings.toml`. Collects architecture statistics (parameter counts,
+tensor size, input channels), inference speed (latency and throughput), and
+trains each backbone with the standard pipeline, reporting its losses and best
+validation metric (accuracy for classification, MAE for regression). Results
+are printed as a table and saved to
+`reports/backbone_comparison_<timestamp>.{json,csv}`. Each trained backbone
+also writes the same per-run artifacts an individual `train` run produces:
+best-model checkpoints in `src/checkpoints`, a per-epoch loss/metric history
+in `reports/loss/`, and a `reports/plot_info_*.json` with its per-sample
+predictions (usable with `plot-train`).
 
 ```bash
 holod compare [--model {efficientnet|vit|resnet50|focusnet|new}]... \
-              [--bins INT] [--crop INT] [--batch INT] [--ep INT] [--lr FLOAT] \
-              [--device {cuda|cpu}] [--sample BOOL] [--skip-train]
+              [--bins INT] [--crop INT] [--batch INT] [--ep INT] \
+              [--device {cuda|cpu}] [--soft-sigma FLOAT] [--sample] \
+              [--display {save|show|both}]
 ```
 
-Repeat `--model` to select a subset (default: all backbones). Training runs
-reuse `train_settings.toml` merged with CLI options, like `train`; with
-`--skip-train` no dataset is needed. Example:
+Repeat `--model` to select a subset (default: every backbone configured in
+`train_settings.toml`). Shared settings merge with CLI options, like `train`;
+per-model settings (learning rate, weight decay, scheduler) come from each
+backbone's own `[<backbone>.train]` section. Example:
 
 ```bash
-holod compare --model focusnet --model resnet50 --bins 10 --ep 5 --sample true
+holod compare --model focusnet --model resnet50 --bins 10 --ep 5 --sample
 ```
 
 `compare-holo`
@@ -177,7 +184,7 @@ Reconstruct amplitude and phase from a hologram using a trained model.
 ```bash
 holod reconstruction [IMG_FILE_PATH] \
                     [--model_path PATH] [--crop_size 512] \
-                    [--wavelength 5.3e-07] [--z 0.02] [--dx 3.8e-06] \
+                    [--wavelength 5.3e-07] [--dx 3.8e-06] \
                     [--display {show|save|both}] \
                     [--amp_true PATH] [--phase_true PATH]
 ```
@@ -186,35 +193,49 @@ If `IMG_FILE_PATH` is empty, the sample hologram is used. The command logs the g
 
 # # Configuration
 
-Default training parameters reside in `train_settings.toml`:
+Default training parameters reside in `train_settings.toml`. The config is
+**multi-model**: settings shared by every backbone (dataset, batch size, crop,
+epochs, device, ...) live at the top level, while each backbone gets its own
+`[<backbone>.train]` section carrying its optimizer and scheduler settings.
+Only backbones with a section can be selected with `train --model` or included
+in `compare`; valid section names are `enet`, `vit`, `resnet`, `pcnn`, and
+`focusnet`.
 
-```bash
+```toml
+# shared by every model
+batch_size  = 8
+crop_size   = 224
+device      = "cuda"
+epoch_count = 15
+num_classes = 20     # set to 1 for regression training
+num_workers = 2
+val_split   = 0.2
+
 [paths]
-dataset_root   = "MW-Dataset"
-meta_csv_name  = "ODP-DLHM-Database.csv"
-
-[train]
-backbone       = "Enet"
-batch_size     = 16
-crop_size      = 224
-device         = "cuda"
-epoch_count    = 15
-learning_rate  = 0.0001
-num_classes    = 10
-num_workers    = 6
-optimizer_weight_decay = 1e-2
-sch_factor     = 0.1
-sch_patience   = 7
-val_split      = 0.1
+dataset_root  = "MW_Dataset_Sample"
+meta_csv_name = "ODP-DLHM-Database.csv"
 
 [flags]
 checkpoint = false
 create_csv = false
 fixed_seed = true
 sample     = false
+
+# one section per model; omitted settings fall back to defaults
+[enet.train]
+backbone                = "enet"
+learning_rate           = 1e-4
+optimizer_weight_decay  = 1e-2
+sch_factor              = 0.1
+sch_patience            = 7
+
+[focusnet.train]
+backbone      = "focusnet"
+learning_rate = 1e-4
 ```
 
-CLI options override these defaults.
+CLI options override the shared settings; `train --lr` overrides the selected
+model's learning rate.
 
 ## Development & Testing
 

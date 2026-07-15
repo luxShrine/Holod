@@ -782,6 +782,137 @@ def determine_lr(
     _learning_rate_report = determine_learning_rate(config, selected)
 
 
+@cli.command("fix-report")
+@click.argument("ds_root", required=False, default="", type=click.Path(file_okay=False))
+@click.option(
+    "--csv-name",
+    "meta_csv_name",
+    default="",
+    type=click.Path(dir_okay=False),
+    help="Path to the metadata CSV file.",
+)
+@click.option(
+    "--model",
+    "backbone",
+    default="efficientnet",
+    show_default=True,
+    type=click.Choice(["efficientnet", "vit", "resnet50", "focusnet", "pcnn"]),
+    help="Model backbone name.",
+)
+@click.option(
+    "--bins",
+    "num_classes",
+    default=10,
+    show_default=True,
+    type=click.IntRange(1, 100),
+    help="Number of classifications, set to 1 for regression training.",
+)
+@click.option(
+    "--crop",
+    "crop_size",
+    default=224,
+    show_default=True,
+    type=click.IntRange(20, 516),
+    help="Size to crop images to.",
+)
+@click.option(
+    "--batch",
+    "batch_size",
+    default=16,
+    show_default=True,
+    type=click.IntRange(1, 64),
+    help="Training batch size.",
+)
+@click.option(
+    "--ep",
+    "epoch_count",
+    default=10,
+    show_default=True,
+    type=click.IntRange(1, 1000),
+    help="Number of training epochs per condition.",
+)
+@click.option(
+    "--device",
+    default="cuda",
+    show_default=True,
+    type=click.Choice(["cuda", "cpu"]),
+    help="Device for training.",
+)
+@click.option(
+    "--holo-count",
+    "holo_count",
+    default=50,
+    show_default=True,
+    type=click.IntRange(1, 10000),
+    help="Validation holograms to focus-score per checkpoint (one FFT propagation each).",
+)
+@click.option(
+    "--seed",
+    default=42,
+    show_default=True,
+    type=int,
+    help="Global torch/numpy/random seed applied before each training run.",
+)
+@click.option(
+    "--sample",
+    "sample",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Use sample data provided.",
+)
+def fix_report(
+    ds_root: str,
+    meta_csv_name: str,
+    backbone: str,
+    num_classes: int,
+    crop_size: int,
+    batch_size: int,
+    epoch_count: int,
+    device: str,
+    holo_count: int,
+    seed: int,
+    sample: bool,
+) -> None:
+    """Report before/after metrics for the random-crop and magnification fixes.
+
+    Trains the chosen backbone twice (with the legacy random-crop augmentation
+    and with the current pipeline) and focus-scores both checkpoints on the
+    shared validation split at both the raw and magnification-corrected
+    reconstruction depths, yielding three conditions with equivalent metrics.
+    """
+    from holod.core.ablation import run_fix_ablation
+    from holod.infra.dataclasses import Flags, Paths
+    from holod.infra.log import console_ as console
+
+    train_settings = Path(TRAIN_SETTINGS_STR)
+    selected = ModelType.from_str(backbone)
+    if train_settings.exists():
+        config = CompareUserConfig.from_toml(train_settings)
+        # config-file values are the base; only options the user explicitly
+        # passed on the command line override them
+        flags = Flags(**_cli_overrides(sample=sample))
+        flags.fixed_seed = True  # both conditions must share the validation split
+        flags.checkpoint = False  # each condition trains from scratch, never resumes
+        config.merge(
+            flags=flags,
+            paths=Paths(ds_root, meta_csv_name),
+            **_cli_overrides(
+                batch_size=batch_size,
+                crop_size=crop_size,
+                device=device,
+                epoch_count=epoch_count,
+                num_classes=num_classes,
+            ),
+        )
+    else:
+        raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
+
+    report = run_fix_ablation(config, selected, holo_count=holo_count, seed=seed)
+    console.print(report.to_table())
+    report.save()
+
+
 cli.add_command(train)
 if __name__ == "__main__":
     cli()
