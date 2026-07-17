@@ -22,7 +22,6 @@ dependencies = [
   "matplotlib>=3.10.1",
   "numpy>=2.2.4",
   "pillow>=11.2.1",
-  "pint>=0.24.4",
   "plotly>=6.0.1",
   "plotly-stubs>=0.0.5",
   "polars>=1.27.1",

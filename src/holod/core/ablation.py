@@ -223,9 +223,9 @@ def _evaluate_checkpoint(
                 device,
                 runs=1,
                 crop_size=crop_size,
-                # CSV Wavelength column is in micrometers
-                wavelength=float(base.wavelength[i]) * 1e-6,
-                dx=SENSOR_PIXEL_PITCH_M,
+                # CSV Wavelength column is in micrometers -> meters
+                wavelength_m=float(base.wavelength_um[i]) * 1e-6,
+                dx_m=SENSOR_PIXEL_PITCH_M,
                 z_true_mm=float(base.z.z_array[i]),
                 l_mm=float(base.records["L_value"][i]) if has_l_value else None,
                 preloaded=preloaded,

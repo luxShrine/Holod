@@ -5,13 +5,13 @@
 batch_size = 8   # Training batch size.
 crop_size = 224  # Size to crop images to.
 device = "cuda"  # Device for training.
-epoch_count = 15 # Number of training epochs.
+epoch_count = 30 # Number of training epochs.
 num_classes = 15 # Number of classifications, set to 1 for regression training.
 num_workers = 2  # Data-loading subprocesses.
 val_split = 0.2  # Fraction of data for validation.
 # Std dev (in bins) of the soft ordinal target distribution for classification
 # (SORD); near-miss bins keep some probability mass. 0 keeps hard one-hot labels.
-soft_label_sigma = 1.0
+soft_label_sigma = 0.5
 
 [paths]
 dataset_root = "MW_Dataset_Sample"

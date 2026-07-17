@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -94,13 +95,24 @@ def correct_data_csv(csv_path: Path) -> pl.DataFrame:
 
 
 def parse_info(info_file: Path) -> dict[str, float]:
-    """For each info.txt, extract data from it."""
+    """For each info.txt, extract data from it.
+
+    Values are taken verbatim in the dataset's CSV units (Wavelength in µm,
+    L_value/z_value in mm); a matching ``um``/``µm``/``mm`` suffix is accepted
+    and stripped, any other suffix (e.g. ``nm``) raises so a wrong-unit file
+    cannot silently corrupt the generated CSV.
+    """
     info: dict[str, float] = {}
     for line in info_file.read_text().splitlines():
         if not line.strip():
             continue
         key, val = line.split("=", 1)
         key = key.strip()
-        val = val.strip().rstrip("um")  # strip units
-        info[key] = float(val)
+        match = re.fullmatch(r"\s*([-+0-9.eE]+)\s*(um|µm|mm)?\s*", val)
+        if match is None:
+            raise ValueError(
+                f"Cannot parse '{key} = {val.strip()}' in {info_file}: expected a number "
+                + "optionally suffixed with um/µm/mm (the dataset's CSV units)."
+            )
+        info[key] = float(match.group(1))
     return info

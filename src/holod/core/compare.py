@@ -389,8 +389,8 @@ def _fill_training_stats(
         bin_centers=bin_centers,
         training_output=output,
         bin_edges=base.bin_edges,
-        z_avg=z_avg,
-        z_std=z_std,
+        z_avg_mm=z_avg,
+        z_std_mm=z_std,
     )
     plot_pred.save_to_file()
 
@@ -744,8 +744,8 @@ def evaluate_checkpoint_on_hologram(
     device: str,
     runs: int,
     crop_size: int,
-    wavelength: float,
-    dx: float,
+    wavelength_m: float,
+    dx_m: float,
     z_true_mm: float | None,
     l_mm: float | None = None,
     preloaded: tuple[nn.Module, AutoConfig, Checkpoint] | None = None,
@@ -784,14 +784,14 @@ def evaluate_checkpoint_on_hologram(
 
     intensity = np.asarray(pil_image.convert("L"), np.float32) / 255.0
     z_recon_mm = dlhm_effective_z_mm(z_pred_mm, l_mm) if l_mm is not None else z_pred_mm
-    entry.focus_tc = focus_score(intensity, wavelength, z_recon_mm * 1e-3, dx)
+    entry.focus_tc = focus_score(intensity, wavelength_m, z_recon_mm * 1e-3, dx_m)
     if l_mm is not None:
         # score the raw depth too (the pre-fix behavior); reuse the corrected value
         # when the degenerate-geometry fallback made both depths identical
         entry.focus_tc_uncorrected = (
             entry.focus_tc
             if z_recon_mm == z_pred_mm
-            else focus_score(intensity, wavelength, z_pred_mm * 1e-3, dx)
+            else focus_score(intensity, wavelength_m, z_pred_mm * 1e-3, dx_m)
         )
     if z_true_mm is not None:
         entry.abs_error_mm = abs(z_pred_mm - z_true_mm)
@@ -813,8 +813,8 @@ def compare_on_hologram(
     ckpt_paths: list[Path] | None = None,
     runs: int = 5,
     crop_size: int = 224,
-    wavelength: float = 530e-9,
-    dx: float = SENSOR_PIXEL_PITCH_M,
+    wavelength_m: float = 405e-9,
+    dx_m: float = SENSOR_PIXEL_PITCH_M,
     z_true_mm: float | None = None,
     l_mm: float | None = None,
     device: str | None = None,
@@ -827,8 +827,9 @@ def compare_on_hologram(
             under ``checkpoints_loc()``.
         runs: How many repeated predictions to time per model.
         crop_size: Center-crop applied before inference (ViT is forced to 224).
-        wavelength: Wavelength of the capture illumination (m), for focus scoring.
-        dx: Pixel pitch of the sensor (m), for focus scoring; defaults to the
+        wavelength_m: Wavelength of the capture illumination (meters, e.g. 405e-9 for
+            the project's 405 nm laser), for focus scoring.
+        dx_m: Pixel pitch of the sensor (meters), for focus scoring; defaults to the
             3.8 µm pitch of the project's capture sensor.
         z_true_mm: Optional ground-truth depth (mm); enables absolute-error ranking.
         l_mm: Optional DLHM source->screen distance L (mm, the dataset's ``L_value``).
@@ -858,7 +859,7 @@ def compare_on_hologram(
         console.rule(f"[black on cyan] Evaluating model: {ckpt_path.name} ")
         try:
             entry = evaluate_checkpoint_on_hologram(
-                ckpt_path, pil_image, dev, runs, crop_size, wavelength, dx, z_true_mm, l_mm
+                ckpt_path, pil_image, dev, runs, crop_size, wavelength_m, dx_m, z_true_mm, l_mm
             )
         except Exception as exc:
             entry = HologramEval(model_name=ckpt_path.name, runs=runs)
@@ -870,8 +871,8 @@ def compare_on_hologram(
         image=Path(img_file_path).as_posix(),
         device=dev,
         runs=runs,
-        wavelength_m=wavelength,
-        dx_m=dx,
+        wavelength_m=wavelength_m,
+        dx_m=dx_m,
         z_true_mm=z_true_mm,
         created=datetime.now().isoformat(timespec="seconds"),
         l_mm=l_mm,

@@ -120,30 +120,28 @@ class PlotPred:
                 raise Exception(f"Unknown step '{step}' passed.")
 
             assert z_pred.shape == z.shape, "Vectors must match"
-            depth_um = z * 1e6
-            err_um = (z_pred - z) * 1e6
+            # depths are already in the dataset's native mm
+            depth_mm = z
+            err_mm = z_pred - z
 
-            # choose depth bins so each violin has ~50 points, tweak divisor
-            n_bins = max(10, len(depth_um) // 50)
-            np.linspace(depth_um.min(), depth_um.max(), n_bins + 1, dtype=np.float64)
             bin_idx = (
-                np.digitize(depth_um, self.bin_edges) - 1  # pyright: ignore[reportCallIssue, reportArgumentType]
+                np.digitize(depth_mm, self.bin_edges) - 1  # pyright: ignore[reportCallIssue, reportArgumentType]
             )  # → 0 … n_bins-1
 
             df = pl.DataFrame(
                 {
                     "bin": bin_idx,
-                    "err_um": err_um,
+                    "err_mm": err_mm,
                 }
             )
 
-            fig = go.Figure(go.Violin(y=df["err_um"], x=df["bin"], width=0.9))
+            fig = go.Figure(go.Violin(y=df["err_mm"], x=df["bin"], width=0.9))
 
             _ = fig.update_layout(
                 yaxis_zeroline=True,
                 title_text=meta.title,
-                xaxis_title_text="True focus depth (µm)",
-                yaxis_title_text="(pred true) (µm)",
+                xaxis_title_text="True focus depth (mm)",
+                yaxis_title_text="(pred true) (mm)",
                 legend_title_text="Legend",
                 hovermode="closest",
             )
@@ -170,19 +168,17 @@ class PlotPred:
 
         num_classes = len(bin_edges) - 1
 
-        # Class labels for the confusion matrix axes
+        # Class labels for the confusion matrix axes; bin centers are in mm
         bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-        # Convert to µm for readability if original units are meters
-        # class_labels_um = [f"{c * 1e6:.1f}µm" for c in bin_centers]
-        class_labels_um = [f"{c:.1f}µm" for c in bin_centers]
+        class_labels_mm = [f"{c:.2f}mm" for c in bin_centers]
 
         cm = confusion_matrix(true_indices_val, pred_indices_val, labels=list(range(num_classes)))
 
         # Create annotated heatmap for confusion matrix using Plotly Figure Factory
         fig_cm = ff.create_annotated_heatmap(
             z=cm,
-            x=class_labels_um,
-            y=class_labels_um,
+            x=class_labels_mm,
+            y=class_labels_mm,
             colorscale="Blues",
             showscale=True,  # Shows the color bar
             reversescale=False,
@@ -194,13 +190,13 @@ class PlotPred:
             xaxis={
                 "tickmode": "array",
                 "tickvals": list(range(num_classes)),
-                "ticktext": class_labels_um,
+                "ticktext": class_labels_mm,
                 "side": "bottom",
             },
             yaxis={
                 "tickmode": "array",
                 "tickvals": list(range(num_classes)),
-                "ticktext": class_labels_um,
+                "ticktext": class_labels_mm,
                 "autorange": "reversed",
             },  # Reversed to match typical CM layout
         )
@@ -216,10 +212,9 @@ class PlotPred:
             "z_val_pred": self.z_val_pred,
             "z_train_pred": self.z_train_pred,
         }
-        # Convert to µm for plotting, concat creates null values automatically since
+        # Depths stay in native mm; concat creates null values automatically since
         # prediction and evaluation arrays aren't the same size
         df: DataFrame = pl.concat(
-            # items=[pl.DataFrame({name: (val * 1e6)}) for name, val in data.items()],
             items=[pl.DataFrame({name: val}) for name, val in data.items()],
             how="horizontal",
         )
@@ -349,8 +344,8 @@ class PlotPred:
         )
 
         # Scatter
-        _ = fig.update_xaxes(title="Focus Depth (µm)", row=1, col=1)
-        _ = fig.update_yaxes(title="Residual (µm)", row=1, col=1)
+        _ = fig.update_xaxes(title="Focus Depth (mm)", row=1, col=1)
+        _ = fig.update_yaxes(title="Residual (mm)", row=1, col=1)
         # Histogram region
         _ = fig.update_xaxes(showticklabels=True, row=1, col=2)
 
@@ -496,8 +491,8 @@ class PlotPred:
 
             _ = fig.update_layout(
                 title_text=meta.title,
-                xaxis_title_text="True focus depth (µm)",
-                yaxis_title_text="Residual (pred–true) (µm)",
+                xaxis_title_text="True focus depth (mm)",
+                yaxis_title_text="Residual (pred–true) (mm)",
                 legend_title_text="Legend",
                 hovermode="closest",
             )
@@ -537,16 +532,14 @@ class PlotPred:
             if z.size == 0:
                 raise Exception("plot_hexbin: no finite points after filtering")
 
-            z_um, z_pred_um = z * 1e6, z_pred * 1e6
-
-            # figure & main hexbin
+            # figure & main hexbin; depths are already in the dataset's native mm
             df = pl.DataFrame(
                 {
-                    "z true": z_um,
-                    "z pred": z_pred_um,
+                    "z true (mm)": z,
+                    "z pred (mm)": z_pred,
                 }
             )
-            fig = px.density_heatmap(df, x="z true", y="z pred", marginal_x="histogram")
+            fig = px.density_heatmap(df, x="z true (mm)", y="z pred (mm)", marginal_x="histogram")
             export.append(PlotCollection(meta, fig))
 
         return export
@@ -579,8 +572,8 @@ class PlotPred:
         core_trainer: CoreTrainer,
         training_output: TrainingOutput,
         bin_centers: Arr64 | None = None,
-        z_avg: float | None = None,
-        z_std: float | None = None,
+        z_avg_mm: float | None = None,
+        z_std_mm: float | None = None,
     ) -> PlotPred:
         device = core_trainer.device
         _: nn.Module = (
@@ -627,14 +620,14 @@ class PlotPred:
                     preds = core_trainer.model(imgs_tens)
                     # convert back to physical units
                     if analysis.value == AnalysisType.REG.value:
-                        if z_avg is None or z_std is None:
+                        if z_avg_mm is None or z_std_mm is None:
                             raise ValueError(
-                                "z_avg and z_std required for regression de-normalization"
+                                "z_avg_mm and z_std_mm required for regression de-normalization"
                             )
 
-                        # bring predictions back to cpu
-                        preds_batch = preds.squeeze().cpu().numpy() * z_std + z_avg
-                        true_batch = labels_tens.cpu().numpy() * z_std + z_avg
+                        # bring predictions back to cpu; de-normalized values are mm
+                        preds_batch = preds.squeeze().cpu().numpy() * z_std_mm + z_avg_mm
+                        true_batch = labels_tens.cpu().numpy() * z_std_mm + z_avg_mm
 
                     elif analysis.value == AnalysisType.CLASS.value:
                         if bin_centers is None:
@@ -753,16 +746,21 @@ def repeat(
 
 def plot_amp_phase(
     img_file_path,
-    wavelength,
+    wavelength_m,
     ckpt_file,
     crop_size,
-    dx,
+    dx_m,
     amp_true: npt.NDArray[Any] | None = None,
     phase_true: npt.NDArray[Any] | None = None,
     path_to_plot: str = "phase_amp.png",
     display: DisplayType = DisplayType.SHOW,
+    l_mm: float | None = None,
 ) -> str | None:
-    """Visualise amplitude & phase reconstruction."""
+    """Visualise amplitude & phase reconstruction.
+
+    ``wavelength_m`` and ``dx_m`` are in meters; ``l_mm`` is the optional DLHM
+    source-to-screen distance (mm) enabling the magnification-corrected depth.
+    """
     from PIL import Image
 
     # from holod.core.metrics import error_metric, wrap_phase
@@ -770,7 +768,7 @@ def plot_amp_phase(
     from holod.core.optics.reconstruction import torch_recon
 
     _hologram, amp_recon, phase_recon, focus_tc = torch_recon(
-        img_file_path, wavelength, ckpt_file, crop_size, dx
+        img_file_path, wavelength_m, ckpt_file, crop_size, dx_m, l_mm=l_mm
     )
 
     # label-free gradient-Tamura focus score; higher is sharper (see focus_score)

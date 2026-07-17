@@ -269,6 +269,7 @@ def train(
     else:
         raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
 
+    autofocus_config.legacy_random_crop = True  # WARN: remove do not commit
     plot_info: PlotPred = train_autofocus(autofocus_config, path_ckpt)
     plot_info.save_to_file()
 
@@ -413,9 +414,9 @@ def compare(
 )
 @click.option(
     "--wavelength",
-    default=530e-9,
+    default=405e-9,
     show_default=True,
-    help="Wavelength of light used to capture the image (m)",
+    help="Wavelength of light used to capture the image, in meters (e.g. 405e-9 for 405 nm)",
 )
 # default matches SENSOR_PIXEL_PITCH_M (kept literal here: heavy types import stays lazy)
 @click.option(
@@ -484,8 +485,8 @@ def compare_holo(
         ckpt_paths=ckpt_paths,
         runs=runs,
         crop_size=crop_size,
-        wavelength=wavelength,
-        dx=dx,
+        wavelength_m=wavelength,
+        dx_m=dx,
         z_true_mm=z_true_mm,
         l_mm=l_mm,
         device=None if device == "auto" else device,
@@ -563,9 +564,9 @@ def plot_train(
 )
 @click.option(
     "--wavelength",
-    default=530e-9,
+    default=405e-9,
     show_default=True,
-    help="Wavelength of light used to capture the image (m)",
+    help="Wavelength of light used to capture the image, in meters (e.g. 405e-9 for 405 nm)",
 )
 # default matches SENSOR_PIXEL_PITCH_M (kept literal here: heavy types import stays lazy)
 @click.option(
@@ -573,6 +574,14 @@ def plot_train(
     default=3.8e-6,
     show_default=True,
     help="Pixel pitch of the capture sensor (m)",
+)
+@click.option(
+    "--l-value",
+    "l_mm",
+    default=None,
+    type=float,
+    help="DLHM source-to-screen distance L (mm, the dataset's L_value); reconstructs at "
+    "the magnification-corrected effective depth instead of the raw predicted depth.",
 )
 @click.option(
     "--display",
@@ -587,6 +596,7 @@ def reconstruction(
     crop_size: int,
     wavelength: float,
     dx: float,
+    l_mm: float | None,
     display: str,
     amp_true: None | npt.NDArray[Any],
     phase_true: None | npt.NDArray[Any],
@@ -631,11 +641,12 @@ def reconstruction(
                 crop_size=crop_size,
                 ckpt_file=model_path,
                 display=display_c,
-                dx=dx,
+                dx_m=dx,
                 img_file_path=img_file_path,
-                wavelength=wavelength,
+                wavelength_m=wavelength,
                 amp_true=amp_true,
                 phase_true=phase_true,
+                l_mm=l_mm,
             )
         elif user_response == "q":
             logger.info("Exiting...")
@@ -651,11 +662,12 @@ def reconstruction(
             crop_size=crop_size,
             ckpt_file=model_path,
             display=display_c,
-            dx=dx,
+            dx_m=dx,
             img_file_path=img_file_path,
-            wavelength=wavelength,
+            wavelength_m=wavelength,
             amp_true=amp_true,
             phase_true=phase_true,
+            l_mm=l_mm,
         )
 
 

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, NewType, TypeVar
 
 import numpy as np
 import numpy.typing as npt
-import pint
 import torch
 from PIL.Image import Image as ImageType
 from torch.utils.data import Subset
@@ -24,13 +23,11 @@ _T_co = TypeVar("_T_co", covariant=True)
 logger = get_logger(__name__)
 
 
-# -- SINGLETON UNIT REGISTRY ---------------------------------------------------------------------
-ureg = pint.UnitRegistry()
-Q_ = ureg.Quantity  # short alias
-
-u = ureg  # short namespace, for u.um, u.nm, u.m
-
 # -- PHYSICAL CONSTANTS --------------------------------------------------------------------------
+# Unit convention (units are carried in names, converted only at explicit boundaries):
+#   - metadata CSV / info.txt: Wavelength in µm (0.405 = 405 nm), L_value/z_value in mm
+#   - training + reporting (labels, z_avg_mm/z_std_mm, MAE): mm
+#   - optics API (recon_inline, focus_score, torch_recon): meters (wavelength_m, z_m, dx_m)
 # pixel pitch of the sensor the datasets were captured with (meters)
 SENSOR_PIXEL_PITCH_M: float = 3.8e-6
 
@@ -49,11 +46,6 @@ type StateDict = dict[str, Any]
 
 StandardDev = NewType("StandardDev", float)
 Mean = NewType("Mean", float)
-
-# -- RANGE GUARDS FROM BEARTYPE ------------------------------------------------------------------
-# BUG: does not work as intended
-# type Nanometers = Annotated[Q_, Is[lambda q: 200 * u.nm <= q <= 2000 * u.nm]]
-# type Micrometers = Annotated[Q_, Is[lambda q: -1_000 * u.um <= q <= 1_000 * u.um]]
 
 # plotting shorthands
 type Plots = Figure | go.Figure | list[go.Figure] | list[Figure]

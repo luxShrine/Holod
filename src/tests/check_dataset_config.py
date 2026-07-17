@@ -308,3 +308,26 @@ def test_hologram_dataset_loads_external_folder(tmp_path: Path):
     (img, label) = ds[0]
     assert img.size == (32, 32)
     assert 0 <= int(label) < 5
+
+
+# -- parse_info ---------------------------------------------------------------------------------
+
+
+def test_parse_info_plain_and_suffixed_values(tmp_path: Path):
+    """Plain numbers and um/mm suffixes parse verbatim (values are already in CSV units)."""
+    from holod.infra.util.image_processing import parse_info
+
+    info_file = tmp_path / "info.txt"
+    info_file.write_text("Wavelength = 0.405um\nL_value = 18.96 mm\nz_value = 0.521\n")
+    info = parse_info(info_file)
+    assert info == {"Wavelength": 0.405, "L_value": 18.96, "z_value": 0.521}
+
+
+def test_parse_info_rejects_unknown_unit(tmp_path: Path):
+    """An unexpected unit suffix (e.g. nm) raises instead of silently misparsing."""
+    from holod.infra.util.image_processing import parse_info
+
+    info_file = tmp_path / "info.txt"
+    info_file.write_text("Wavelength = 405nm\n")
+    with pytest.raises(ValueError, match="Wavelength"):
+        parse_info(info_file)

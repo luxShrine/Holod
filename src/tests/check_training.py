@@ -65,7 +65,8 @@ def create_test_dataset(mode: AnalysisType = AnalysisType.CLASS) -> HologramFocu
         # new images potentially
         paths = [f.as_posix() for f in TEST_IMGS.resolve().glob("*.jpg")]
         num_images = len(paths)
-        z_values = np.linspace(start=1e-6, stop=5e-6, num=num_images, dtype=np.float64)
+        # mm scale, matching the real dataset convention (z_value column is mm)
+        z_values = np.linspace(start=1.0, stop=5.0, num=num_images, dtype=np.float64)
 
         wavelengths = np.full((num_images), 0.405)
         data = [
@@ -100,15 +101,6 @@ def test_dataset() -> None:
     assert isinstance(image, ImageType)
     label_type = float if ds.mode == AnalysisType.REG else np.int64
     assert isinstance(label, label_type)
-
-    # if not isinstance(wavelength_m, Q_) or not isinstance(z_m, Q_):
-    #
-    #     print(
-    #         "==== Unexpected Types in Hologram ==== "
-    #         f"wavelength not units, is {type(wavelength_m)}"
-    #         f"z not units, is {type(z_m)}"
-    #         f"pixel_size_m not units, is {type(pixel_size_m)}"
-    #     )
 
 
 def create_test_loader() -> tuple[Tensor, Tensor]:
@@ -389,7 +381,8 @@ def test_image_processing():
     # ip.parse_info()
     paths = [f.as_posix() for f in TEST_IMGS.resolve().glob("*.jpg")]
     num_images = len(paths)
-    z_values = np.linspace(start=1e-6, stop=5e-6, num=num_images, dtype=np.float64)
+    # mm scale, matching the real dataset convention (z_value column is mm)
+    z_values = np.linspace(start=1.0, stop=5.0, num=num_images, dtype=np.float64)
     wavelengths = np.full((num_images), 0.405)
     df = pl.DataFrame(
         [
@@ -472,25 +465,3 @@ def test_image_processing():
 # assert z_true.size() == z_pred.size(), (
 #     "z_pred and z_true are not the same size, cannot be compared"
 #     )
-
-# TODO:
-# def check_units(vars_to_check: dict[Q_, u]) -> bool:
-#     """Returns ``True`` if all quantities have the expected units.
-# Example usage:
-# '''
-# quant_dict = {
-#     z_m: u.m,
-#     wavelength_m: u.m,
-#     pixel_size_m: u.m,
-# }
-# if not check_units(quant_dict):
-#     raise RuntimeError
-#    '''
-# """
-#     i = 0
-#     for v, units in vars_to_check.items():
-#         if v.u == units:
-#             continue
-#         i += 1
-#         logger.error(f"found unexpected units, expected {units} but got {v.to_compact}")
-#     return i != 1

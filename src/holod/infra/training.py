@@ -404,6 +404,6 @@ def train_autofocus(a_config: AutoConfig, path_ckpt: str | None = None) -> PlotP
         bin_centers=bin_centers,
         training_output=training_output,
         bin_edges=holo_base_ds.bin_edges,
-        z_avg=z_avg,
-        z_std=z_std,
+        z_avg_mm=z_avg,
+        z_std_mm=z_std,
     )

@@ -24,7 +24,6 @@ from holod.infra.log import get_logger
 from holod.infra.losses import SoftOrdinalCrossEntropy
 from holod.infra.models import FocusNetTorch, NeuralNetwork
 from holod.infra.util.types import (
-    Q_,
     AnalysisType,
     Arr64,
     CreateCSVOption,
@@ -34,13 +33,11 @@ from holod.infra.util.types import (
     StateDict,
     SubsetList,
     UserDevice,
-    u,
 )
 
 if TYPE_CHECKING:
     import numpy.typing as npt
     from PIL.Image import Image as ImageType
-    from pint.facets.plain.quantity import PlainQuantity
     from torch.nn import Module
     from torch.optim import Optimizer
 
@@ -549,7 +546,11 @@ class CompareUserConfig:
 
 @dataclass
 class CoreTrainer:
-    """Class to hold all the training information."""
+    """Class to hold all the training information.
+
+    ``z_avg_mm``/``z_std_mm`` are the regression label-normalization stats,
+    computed from the training subset's z-values in millimeters.
+    """
 
     a_cfg: AutoConfig
     evaluation_metric: npt.NDArray[np.float64] | npt.NDArray[np.intp]
@@ -562,8 +563,8 @@ class CoreTrainer:
     train_loader: DataLoader[tuple[ImageType, np.float64]]
     val_ds: Dataset[tuple[ImageType, np.float64]]
     val_loader: DataLoader[tuple[ImageType, np.float64]]
-    z_std: PlainQuantity[float]
-    z_avg: PlainQuantity[float]
+    z_std_mm: float
+    z_avg_mm: float
 
     @property
     def device(self):
@@ -581,7 +582,7 @@ class CoreTrainer:
         """Return the standard deviation and average if necessitated by analysis."""
         match analysis:
             case AnalysisType.REG:
-                return (Mean(self.z_avg.magnitude), StandardDev(self.z_std.magnitude))
+                return (Mean(self.z_avg_mm), StandardDev(self.z_std_mm))
             case _:
                 return (None, None)
 
@@ -859,8 +860,8 @@ def create_training_setup(
     """Split the dataset, apply transforms and build dataloaders."""
     (train_subset, eval_subset) = a_cfg.setup_loader_indices(base)
     logger.debug("Train and evaluation subset created successfully")
-    # Calculate avg and std from the training subset's physical z-values
-    # Need to access original z_m from base dataset via indices of train_subset
+    # Calculate avg and std from the training subset's physical z-values (mm)
+    # Need to access original z (mm) from base dataset via indices of train_subset
     (z_avg, z_std) = base.z.subset_mean_std(subset_indices=train_subset.indices)
 
     # Define label transforms based on analysis type (handles normalization for REG)
@@ -937,7 +938,7 @@ def create_training_setup(
     # Create CoreTrainer
     core_trainer_config = CoreTrainer(
         a_cfg=a_cfg,
-        evaluation_metric=evaluation_metric,  # This is Arr64 of z_m or bin_centers_m
+        evaluation_metric=evaluation_metric,  # Arr64 of z (mm) or bin indices
         bin_centers=base.bin_centers if a_cfg.analysis == AnalysisType.CLASS else None,
         model=model,
         loss_fn=loss_fn,
@@ -947,8 +948,8 @@ def create_training_setup(
         train_loader=train_dl,
         val_ds=eval_subset,
         val_loader=eval_dl,
-        z_std=Q_(z_std, u.m),
-        z_avg=Q_(z_avg, u.m),
+        z_std_mm=float(z_std),
+        z_avg_mm=float(z_avg),
     )
     if not quiet:
         logger.info("Training Setup Complete")

@@ -35,12 +35,18 @@ i = 1j  # just for my sanity
 
 def torch_recon(
     img_file_path: str,
-    wavelength: float,
+    wavelength_m: float,
     ckpt_file: str,
     crop_size: int = 512,
-    dx: float = SENSOR_PIXEL_PITCH_M,
+    dx_m: float = SENSOR_PIXEL_PITCH_M,
+    l_mm: float | None = None,
 ):
-    """Reconstruct amplitude/phase from a hologram image using a depth predicted by a model."""
+    """Reconstruct amplitude/phase from a hologram image using a depth predicted by a model.
+
+    ``wavelength_m`` and ``dx_m`` (pixel pitch) are in meters. ``l_mm`` is the DLHM
+    source-to-screen distance (the dataset's ``L_value``, mm); when given, the hologram
+    is reconstructed at the magnification-corrected depth ``dlhm_effective_z_mm``.
+    """
     pil_image: ImageType = Image.open(img_file_path).convert("RGB")
     pil_image_crop = crop_max_square(pil_image)
     np.asarray(crop_max_square(pil_image))
@@ -107,24 +113,35 @@ def torch_recon(
             # discrete estimate
             index = int(probs.argmax(1).item())  # ensure integer type
             centers = np.asarray(bin_centers, dtype=np.float32)  # retrive that depth in mm
-            z_expect = float(centers[index])
+            z_pred_mm = float(centers[index])
         elif cfg.analysis == AnalysisType.REG:
-            z_expect = float(
+            z_pred_mm = float(
                 pred.squeeze()  # convert to scalar first
             )
             if z_avg is not None and z_std is not None:
-                # reverse the label normalization applied during training
-                z_expect = z_expect * z_std + z_avg
+                # reverse the label normalization applied during training (stats are mm)
+                z_pred_mm = z_pred_mm * z_std + z_avg
             else:
                 logger.warning(
                     "Checkpoint lacks z_avg/z_std normalization stats; "
                     + "regression output taken as-is."
                 )
 
+    if l_mm is not None:
+        z_recon_mm = dlhm_effective_z_mm(z_pred_mm, l_mm)
+    else:
+        z_recon_mm = z_pred_mm
+        logger.warning(
+            "No L_value given; skipping the DLHM magnification correction, so the "
+            + "reconstruction/focus score may be at the wrong plane. Pass --l-value to correct."
+        )
+
     # torch expects float32
     intensity_image = np.asarray(crop_max_square(pil_image).convert("L"), np.float32) / 255.0
-    amp, phase = recon_inline(intensity_image, wavelength=wavelength, z=z_expect * 1e-3, px=dx)
-    focus_tc = focus_score(intensity_image, wavelength, z_expect * 1e-3, dx)
+    amp, phase = recon_inline(
+        intensity_image, wavelength_m=wavelength_m, z_m=z_recon_mm * 1e-3, px_m=dx_m
+    )
+    focus_tc = focus_score(intensity_image, wavelength_m, z_recon_mm * 1e-3, dx_m)
 
     hologram = np.array(pil_image_crop)
     # TODO: collect these returns into a dataclass for easier access/processing
@@ -133,15 +150,18 @@ def torch_recon(
 
 def recon_inline(
     intensity: Arr32,
-    wavelength: float,
-    z: float,
-    px: float,
+    wavelength_m: float,
+    z_m: float,
+    px_m: float,
     field0: npt.NDArray[np.complex64] | None = None,
     reference: npt.NDArray[np.complex64] | float | None = None,
     method: ReconstructionMethod = ReconstructionMethod.FRESNEL,
     pad: bool = True,
 ) -> tuple[Arr32, Arr32]:
     """Reconstruct amplitude and phase by scalar diffraction propagation.
+
+    ``wavelength_m``, ``z_m`` (propagation distance), and ``px_m`` (pixel pitch)
+    must all be in meters.
 
     Returns:
         amplitude : float32 array (H, W)
@@ -188,20 +208,20 @@ def recon_inline(
     logger.info("Computing Reconstruction...")
 
     H, W = field.shape
-    k = 2.0 * np.pi / wavelength
+    k = 2.0 * np.pi / wavelength_m
 
     #  Frequency grids
     # NOTE: np.fft.fftfreq(N, d) returns cycles/meter, might need to multiply by 2π
     # to return proper units
-    fx = np.fft.fftfreq(W, d=px)  # length W (x corresponds to columns)
-    fy = np.fft.fftfreq(H, d=px)  # length H (y corresponds to rows)
+    fx = np.fft.fftfreq(W, d=px_m)  # length W (x corresponds to columns)
+    fy = np.fft.fftfreq(H, d=px_m)  # length H (y corresponds to rows)
     FX, FY = np.meshgrid(fx, fy, indexing="xy")  # shapes (H, W)
 
     match method:
         case ReconstructionMethod.FRESNEL:
             # Fresnel-FFT transfer function:
             # H(fx,fy) = exp(i k z) * exp(-i π λ z (fx^2 + fy^2))
-            Hf = np.exp(i * k * z) * np.exp(-i * np.pi * wavelength * z * (FX**2 + FY**2))
+            Hf = np.exp(i * k * z_m) * np.exp(-i * np.pi * wavelength_m * z_m * (FX**2 + FY**2))
             U1 = np.fft.ifft2(np.fft.fft2(field) * Hf)
         case ReconstructionMethod.ANGULAR:
             # Angular spectrum:
@@ -213,7 +233,7 @@ def recon_inline(
             kxy_sq = kx**2 + ky**2
             # evanescent components: where kxy_sq > k^2 ⇒ imaginary kz (decays). Keep complex sqrt.
             kz = np.sqrt(np.maximum(0, k_sq - kxy_sq)) + (i * np.sqrt(np.maximum(0, kxy_sq - k_sq)))
-            Ha = np.exp(i * z * kz)
+            Ha = np.exp(i * z_m * kz)
             U1 = np.fft.ifft2(np.fft.fft2(field) * Ha)
 
     # Remove padding
@@ -253,8 +273,8 @@ def gradient_tamura(amplitude: npt.NDArray[np.floating[Any]]) -> float:
     return tamura_coefficient(np.sqrt(gx**2 + gy**2))
 
 
-def focus_score(intensity: Arr32, wavelength: float, z: float, px: float) -> float:
-    """Label-free focus sharpness of a hologram reconstructed at depth ``z`` (m).
+def focus_score(intensity: Arr32, wavelength_m: float, z_m: float, px_m: float) -> float:
+    """Label-free focus sharpness of a hologram reconstructed at depth ``z_m`` (meters).
 
     Suppresses the DC reference term (uses the hologram contrast ``I/mean(I) - 1``,
     without which the propagated field is dominated by the background and carries no
@@ -263,7 +283,9 @@ def focus_score(intensity: Arr32, wavelength: float, z: float, px: float) -> flo
     """
     meas = np.asarray(intensity, dtype=np.float32)
     contrast = (meas / max(float(meas.mean()), 1e-12) - 1.0).astype(np.complex64)
-    (amplitude, _phase) = recon_inline(meas, wavelength=wavelength, z=z, px=px, field0=contrast)
+    (amplitude, _phase) = recon_inline(
+        meas, wavelength_m=wavelength_m, z_m=z_m, px_m=px_m, field0=contrast
+    )
     return gradient_tamura(amplitude)
 
 
