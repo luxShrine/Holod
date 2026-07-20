@@ -159,7 +159,7 @@ to `reports/hologram_comparison.{json,csv}` alongside a bar-chart plot.
 ```bash
 holod compare-holo IMG_FILE_PATH \
                    [--model-path PATH]... [--runs 5] [--crop_size 224] \
-                   [--wavelength 5.3e-07] [--dx 3.8e-06] \
+                   [--wavelength 4.05e-07] [--dx 3.8e-06] \
                    [--z-true MM] [--l-value MM] \
                    [--device {cuda|cpu}] [--display {save|show|both}]
 ```
@@ -184,12 +184,13 @@ Reconstruct amplitude and phase from a hologram using a trained model.
 ```bash
 holod reconstruction [IMG_FILE_PATH] \
                     [--model_path PATH] [--crop_size 512] \
-                    [--wavelength 5.3e-07] [--dx 3.8e-06] \
+                    [--wavelength 4.05e-07] [--dx 3.8e-06] \
+                    [--l-value MM] \
                     [--display {show|save|both}] \
                     [--amp_true PATH] [--phase_true PATH]
 ```
 
-If `IMG_FILE_PATH` is empty, the sample hologram is used. The command logs the gradient‑Tamura focus score of the reconstruction (higher is sharper) and optionally saves plots.
+If `IMG_FILE_PATH` is empty, the sample hologram is used. The command logs the gradient‑Tamura focus score of the reconstruction (higher is sharper) and optionally saves plots. Pass `--l-value` (the dataset's `L_value`, mm) whenever possible so the reconstruction happens at the plane-wave-equivalent depth `M*(L - z)` instead of the raw predicted depth. Note `--wavelength` is in meters (e.g. `4.05e-07` for the 405 nm laser), while the CSV records it in micrometers.
 
 # # Configuration
 

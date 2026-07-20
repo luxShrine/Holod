@@ -14,7 +14,7 @@ import torch.optim as optim
 from serde import Untagged, serde
 from serde.toml import from_toml
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from torchvision import models
 from torchvision.transforms import v2
 
@@ -133,6 +133,8 @@ class AutoConfig:
         batch_size: How many images to process per epoch.
         val_split: Value split between prediction training and validation,
         leftover percentage is given to testing.
+        split_by_sample: When True, whole sample groups (the digit_sample_name
+        directories) are assigned to either train or eval, never both.
 
         crop_size: Length/width to crop the image to.
         opt_lr: The optimizers defined learning rate.
@@ -166,6 +168,9 @@ class AutoConfig:
     soft_label_sigma: float = 0.0
     fixed_seed: bool = True
     checkpoint: bool = False
+    # split train/eval on whole sample groups (the digit_sample_name directories)
+    # instead of individual images, so no sample appears in both loaders
+    split_by_sample: bool = False
     # re-enable the pre-fix RandomResizedCrop training augmentation (ablation runs only)
     legacy_random_crop: bool = False
 
@@ -187,6 +192,7 @@ class AutoConfig:
                 "sch_factor": self.sch_factor,
                 "sch_patience": self.sch_patience,
                 "soft_label_sigma": self.soft_label_sigma,
+                "split_by_sample": self.split_by_sample,
                 "val_split": self.val_split,
             }
         )
@@ -200,14 +206,71 @@ class AutoConfig:
         )
 
     def setup_loader_indices(self, base: HologramFocusDataset) -> SubsetList:
-        """Create random split of training and evaluation loader indices."""
+        """Create the training and evaluation loader indices.
+
+        With ``split_by_sample`` off, images are randomly split regardless of which
+        sample they picture. With it on, whole sample groups are assigned to one
+        side only, sized to approximate ``val_split``.
+        """
+        generator = torch.Generator()
+        if self.fixed_seed:
+            generator = generator.manual_seed(42)
+        if self.split_by_sample:
+            return self._split_sample_groups(base, generator)
         num_labels: int = len(base)
         eval_len: int = int(self.val_split * num_labels)
         train_len: int = num_labels - eval_len
-        if self.fixed_seed:
-            generator = torch.Generator().manual_seed(42)
-            return random_split(base, [train_len, eval_len], generator)
-        return random_split(base, [train_len, eval_len])
+        return random_split(base, [train_len, eval_len], generator)
+
+    def _split_sample_groups(
+        self, base: HologramFocusDataset, generator: torch.Generator
+    ) -> SubsetList:
+        """Split the dataset on sample groups so no sample spans both loaders.
+
+        Groups are visited in a shuffled order and assigned to the evaluation side
+        only while doing so brings its image count closer to the ``val_split``
+        target; every other group goes to training.
+        """
+        groups: dict[str, list[int]] = base.sample_group_indices()
+        if len(groups) < 2:
+            raise RuntimeError(
+                "Sample-wise splitting needs at least two sample groups, "
+                f"but the dataset only contains {sorted(groups)}. "
+                "Disable split_by_sample for this dataset."
+            )
+        names: list[str] = sorted(groups)
+        order = torch.randperm(len(names), generator=generator).tolist()
+        target_eval: float = self.val_split * len(base)
+
+        eval_names: list[str] = []
+        train_names: list[str] = []
+        eval_count: int = 0
+        for pos in order:
+            name = names[pos]
+            size = len(groups[name])
+            if abs(eval_count + size - target_eval) <= abs(eval_count - target_eval):
+                eval_names.append(name)
+                eval_count += size
+            else:
+                train_names.append(name)
+        # lopsided group sizes can starve one side; hand it the other side's smallest group
+        if not eval_names:
+            smallest = min(train_names, key=lambda n: len(groups[n]))
+            train_names.remove(smallest)
+            eval_names.append(smallest)
+        if not train_names:
+            smallest = min(eval_names, key=lambda n: len(groups[n]))
+            eval_names.remove(smallest)
+            train_names.append(smallest)
+
+        train_indices: list[int] = [i for n in train_names for i in groups[n]]
+        eval_indices: list[int] = [i for n in eval_names for i in groups[n]]
+        logger.info(
+            f"Sample-wise split: {len(eval_indices)}/{len(base)} images held out "
+            f"({len(eval_indices) / len(base):.1%} vs requested {self.val_split:.1%}). "
+            f"Eval samples: {sorted(eval_names)}; train samples: {sorted(train_names)}."
+        )
+        return [Subset(base, train_indices), Subset(base, eval_indices)]
 
     def device(self) -> Literal["cuda", "cpu"]:
         """Return the device to use in autofocus training."""
@@ -259,6 +322,7 @@ class AutoConfig:
         meta_csv: str,
         checkpoint: bool | None = None,
         fixed_seed: bool | None = None,
+        split_by_sample: bool | None = None,
         opt_weight_decay: float | None = None,
         opt_lr: float | None = None,
         sch_factor: float | None = None,
@@ -281,6 +345,7 @@ class AutoConfig:
         # ensure not None; fall back to the class-level defaults
         checkpoint = checkpoint if checkpoint is not None else False
         fixed_seed = fixed_seed if fixed_seed is not None else True
+        split_by_sample = split_by_sample if split_by_sample is not None else False
         opt_lr = opt_lr if opt_lr is not None else 5e-5
         opt_weight_decay = opt_weight_decay if opt_weight_decay is not None else 1e-2
         # ReduceLROnPlateau requires factor < 1.0
@@ -299,6 +364,7 @@ class AutoConfig:
             device_user=UserDevice.determine(device_user),
             epoch_count=epoch_count,
             fixed_seed=fixed_seed,
+            split_by_sample=split_by_sample,
             meta_csv_strpath=meta_csv,
             num_classes=num_classes,
             opt_lr=opt_lr,
@@ -343,11 +409,14 @@ class Flags:
     create_csv: bool | None = None
     fixed_seed: bool | None = None
     sample: bool | None = None
+    split_by_sample: bool | None = None
 
     @classmethod
     def empty(cls):
         """Return a Flags instance with every flag unset (never overrides on merge)."""
-        return cls(checkpoint=None, create_csv=None, fixed_seed=None, sample=None)
+        return cls(
+            checkpoint=None, create_csv=None, fixed_seed=None, sample=None, split_by_sample=None
+        )
 
 
 @serde(tagging=Untagged)
@@ -535,6 +604,7 @@ class CompareUserConfig:
             meta_csv=out.paths.meta_csv_name,
             checkpoint=out.flags.checkpoint,
             fixed_seed=out.flags.fixed_seed,
+            split_by_sample=out.flags.split_by_sample,
             # train cfg
             backbone=t_cfg.train.backbone,
             opt_lr=t_cfg.train.learning_rate,

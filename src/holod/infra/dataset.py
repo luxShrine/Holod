@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, override
 
 import numpy as np
@@ -110,6 +110,12 @@ class HologramFocusDataset(Dataset[tuple[ImageType, np.float64 | int]]):
         # smooth tests or simulated holograms without managing paths
         self.paths: list[Path] = [holo_dir / Path(p) for p in self.records["path"].to_list()]
 
+        # sample group of each record (the digit_sample_name directory in the
+        # dataset layout); lets the split keep whole samples in one loader
+        self.sample_names: list[str] = [
+            self._sample_name_from_path(p) for p in self.records["path"].to_list()
+        ]
+
         # CSV z_value column is in millimeters
         self.z: HologramDepths = HologramDepths(self.records["z_value"].to_numpy())
         # CSV Wavelength column is in micrometers (e.g. 0.405 for a 405 nm laser)
@@ -176,6 +182,32 @@ class HologramFocusDataset(Dataset[tuple[ImageType, np.float64 | int]]):
 
         # Return quantities for clarity
         return (img, label)
+
+    @staticmethod
+    def _sample_name_from_path(rel_path: str) -> str:
+        """Extract the sample group name from a CSV-relative image path.
+
+        The dataset layout is ``<top_level>/<wavelength>/<digit_sample_name>/<zlevel>/<img>``,
+        so the sample directory is always two levels above the image regardless of
+        how deeply the dataset root itself is nested.
+        """
+        parts = PurePosixPath(rel_path.replace("\\", "/")).parts
+        if len(parts) >= 3:
+            return parts[-3]
+        # too shallow to carry a sample directory (e.g. flat test datasets):
+        # treat each image as its own group so no records silently collapse together
+        return rel_path
+
+    def sample_group_indices(self) -> dict[str, list[int]]:
+        """Map each sample group name to the record indices belonging to it.
+
+        Records of the same sample captured at different wavelengths share a group,
+        so a sample-wise split never leaks a specimen across train and eval.
+        """
+        groups: dict[str, list[int]] = {}
+        for idx, name in enumerate(self.sample_names):
+            groups.setdefault(name, []).append(idx)
+        return groups
 
     def read_records(self, existing_df: None | pl.DataFrame) -> pl.DataFrame:
         """Read the values of the dataset, either from file or dataframe."""

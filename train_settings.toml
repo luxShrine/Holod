@@ -5,7 +5,7 @@
 batch_size = 8   # Training batch size.
 crop_size = 224  # Size to crop images to.
 device = "cuda"  # Device for training.
-epoch_count = 30 # Number of training epochs.
+epoch_count = 10 # Number of training epochs.
 num_classes = 15 # Number of classifications, set to 1 for regression training.
 num_workers = 2  # Data-loading subprocesses.
 val_split = 0.2  # Fraction of data for validation.
@@ -22,6 +22,9 @@ checkpoint = false # Continue from checkpoint
 create_csv = false # Create a CSV for data.
 fixed_seed = true  # Keep the random seed consistent.
 sample = false     # Use sample data provided.
+# Split train/eval on whole sample groups (the digit_sample_name directories),
+# so no sample's holograms appear in both loaders. false mixes images freely.
+split_by_sample = true
 
 [enet.train]
 backbone = "enet"

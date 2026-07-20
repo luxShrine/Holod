@@ -169,6 +169,13 @@ def cli():
     show_default=True,
     help="Use sample data provided.",
 )
+@click.option(
+    "--split-by-sample/--split-mixed",
+    "split_by_sample",
+    default=False,
+    show_default=True,
+    help="Assign each sample's holograms entirely to train or eval, never both.",
+)
 def train(
     ds_root: str,
     meta_csv_name: str,
@@ -185,6 +192,7 @@ def train(
     checkpoint: bool,
     create_csv: bool,
     sample: bool,
+    split_by_sample: bool,
 ) -> None:
     """Train the autofocus model based on supplied dataset.
 
@@ -216,6 +224,7 @@ def train(
                     create_csv=create_csv,
                     fixed_seed=fixed_seed,
                     sample=sample,
+                    split_by_sample=split_by_sample,
                 )
             ),
             paths=Paths(ds_root, meta_csv_name),
@@ -252,7 +261,7 @@ def train(
         )
         config = CompareUserConfig.from_model_config(model_config)
         config = config.merge(
-            flags=Flags(checkpoint, create_csv, fixed_seed, sample),
+            flags=Flags(checkpoint, create_csv, fixed_seed, sample, split_by_sample),
             paths=Paths(ds_root, meta_csv_name),
             batch_size=batch_size,
             crop_size=crop_size,
@@ -338,6 +347,13 @@ def train(
     help="Use sample data provided.",
 )
 @click.option(
+    "--split-by-sample/--split-mixed",
+    "split_by_sample",
+    default=False,
+    show_default=True,
+    help="Assign each sample's holograms entirely to train or eval, never both.",
+)
+@click.option(
     "--display",
     default="save",
     show_default=True,
@@ -353,6 +369,7 @@ def compare(
     device: str,
     soft_label_sigma: float,
     sample: bool,
+    split_by_sample: bool,
     display: str,
 ) -> None:
     """Compare each configured model backbone under the shared configuration."""
@@ -370,7 +387,7 @@ def compare(
         # config-file values are the base; only options the user explicitly
         # passed on the command line override them
         config.merge(
-            flags=Flags(**_cli_overrides(sample=sample)),
+            flags=Flags(**_cli_overrides(sample=sample, split_by_sample=split_by_sample)),
             paths=Paths.empty(),
             **_cli_overrides(
                 batch_size=batch_size,

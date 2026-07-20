@@ -19,6 +19,7 @@ from PIL import Image
 import holod.infra.util.paths as paths
 from holod.infra.dataclasses import (
     SAMPLE_PATH,
+    AutoConfig,
     CompareUserConfig,
     Flags,
     ModelConfig,
@@ -331,3 +332,73 @@ def test_parse_info_rejects_unknown_unit(tmp_path: Path):
     info_file.write_text("Wavelength = 405nm\n")
     with pytest.raises(ValueError, match="Wavelength"):
         parse_info(info_file)
+
+
+# -- sample-wise train/eval split ---------------------------------------------------------------
+
+
+def _grouped_dataframe() -> pl.DataFrame:
+    """Synthetic records following the <top>/<wavelength>/<sample>/<zlevel>/<img> layout."""
+    rel_paths: list[str] = []
+    for wavelength in ("405", "510"):
+        for sample in ("1_Reticulos", "2_Aspergillus", "3_Diatom", "9_Feather"):
+            for z_level in range(1, 6):
+                rel_paths.append(f"./MW-Dataset/{wavelength}/{sample}/z{z_level}/1.jpg")
+    n = len(rel_paths)
+    return pl.DataFrame(
+        [
+            pl.Series("path", rel_paths, dtype=pl.String),
+            pl.Series("z_value", np.linspace(1.0, 5.0, n, dtype=np.float64)),
+            pl.Series("Wavelength", np.full(n, 0.405)),
+        ]
+    )
+
+
+def test_sample_group_indices_span_wavelengths():
+    """A sample recorded at several wavelengths forms a single group."""
+    ds = HologramFocusDataset.from_df(AnalysisType.CLASS, 5, _grouped_dataframe())
+    groups = ds.sample_group_indices()
+    assert set(groups) == {"1_Reticulos", "2_Aspergillus", "3_Diatom", "9_Feather"}
+    # 5 z-levels under each of the 2 wavelengths
+    assert all(len(indices) == 10 for indices in groups.values())
+
+
+def test_split_by_sample_keeps_groups_apart():
+    """Sample-wise splitting never places one sample's images in both loaders."""
+    ds = HologramFocusDataset.from_df(AnalysisType.CLASS, 5, _grouped_dataframe())
+    cfg = AutoConfig(split_by_sample=True, val_split=0.25, num_classes=5, num_workers=0)
+    (train_subset, eval_subset) = cfg.setup_loader_indices(ds)
+    assert len(train_subset.indices) + len(eval_subset.indices) == len(ds)
+    train_samples = {ds.sample_names[i] for i in train_subset.indices}
+    eval_samples = {ds.sample_names[i] for i in eval_subset.indices}
+    assert train_samples and eval_samples
+    assert not (train_samples & eval_samples)
+    # equal group sizes: a 0.25 split of 4 groups holds out exactly one sample
+    assert len(eval_samples) == 1
+
+
+def test_split_by_sample_needs_multiple_groups():
+    """A dataset with a single sample group cannot be split sample-wise."""
+    rel_paths = [f"./MW-Dataset/405/1_Reticulos/z{z}/{i}.jpg" for z in range(1, 7) for i in range(6)]
+    n = len(rel_paths)
+    df = pl.DataFrame(
+        [
+            pl.Series("path", rel_paths, dtype=pl.String),
+            pl.Series("z_value", np.linspace(1.0, 5.0, n, dtype=np.float64)),
+            pl.Series("Wavelength", np.full(n, 0.405)),
+        ]
+    )
+    ds = HologramFocusDataset.from_df(AnalysisType.CLASS, 5, df)
+    cfg = AutoConfig(split_by_sample=True, num_classes=5, num_workers=0)
+    with pytest.raises(RuntimeError, match="at least two sample groups"):
+        _ = cfg.setup_loader_indices(ds)
+
+
+def test_split_by_sample_flag_reaches_auto_config(monkeypatch: pytest.MonkeyPatch):
+    """The flags.split_by_sample toggle flows through to the runtime AutoConfig."""
+    _ban_user_prompts(monkeypatch)
+    flags = Flags(
+        checkpoint=False, create_csv=False, fixed_seed=True, sample=True, split_by_sample=True
+    )
+    cfg = build_config(flags=flags).resolve_paths()
+    assert cfg.to_auto_config(ModelType.ENET).split_by_sample is True
