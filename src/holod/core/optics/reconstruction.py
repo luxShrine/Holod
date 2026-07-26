@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -33,6 +34,15 @@ logger = get_logger(__name__)
 i = 1j  # just for my sanity
 
 
+def load_intensity(path: Path, crop: int | None = None) -> np.ndarray:
+    img = crop_max_square(Image.open(path).convert("L"))
+    if crop is not None:
+        w, h = img.size
+        left, top = (w - crop) // 2, (h - crop) // 2
+        img = img.crop((left, top, left + crop, top + crop))
+    return np.asarray(img, np.float32) / 255.0
+
+
 def torch_recon(
     img_file_path: str,
     wavelength_m: float,
@@ -49,7 +59,6 @@ def torch_recon(
     """
     pil_image: ImageType = Image.open(img_file_path).convert("RGB")
     pil_image_crop = crop_max_square(pil_image)
-    np.asarray(crop_max_square(pil_image))
 
     # build architecture + load weights
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -114,7 +123,7 @@ def torch_recon(
             index = int(probs.argmax(1).item())  # ensure integer type
             centers = np.asarray(bin_centers, dtype=np.float32)  # retrive that depth in mm
             z_pred_mm = float(centers[index])
-        elif cfg.analysis == AnalysisType.REG:
+        else:
             z_pred_mm = float(
                 pred.squeeze()  # convert to scalar first
             )
@@ -137,7 +146,7 @@ def torch_recon(
         )
 
     # torch expects float32
-    intensity_image = np.asarray(crop_max_square(pil_image).convert("L"), np.float32) / 255.0
+    intensity_image = load_intensity(Path(img_file_path))
     amp, phase = recon_inline(
         intensity_image, wavelength_m=wavelength_m, z_m=z_recon_mm * 1e-3, px_m=dx_m
     )

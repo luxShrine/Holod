@@ -35,10 +35,10 @@ Dataset Preparation
 
 Training expects a CSV in the dataset root with columns:
 
-|  | Description
+| | Description
 | ------------- | -------------- |
-| path  | Path to each image relative to the CSV file
-| Wavelength |  Laser wavelength in micrometers (e.g. 0.405 for a 405 nm laser)
+| path | Path to each image relative to the CSV file
+| Wavelength | Laser wavelength in micrometers (e.g. 0.405 for a 405 nm laser)
 | L_value | Distance from point source to sensor/screen (mm)
 | z_value | Ground‑truth distance from point source to sample (mm); the DLHM magnification is M = L/z
 
@@ -68,7 +68,7 @@ Global options
 
 - `--help` – show command help.
 
-## Commands
+### Commands
 
 `train`
 
@@ -192,7 +192,15 @@ holod reconstruction [IMG_FILE_PATH] \
 
 If `IMG_FILE_PATH` is empty, the sample hologram is used. The command logs the gradient‑Tamura focus score of the reconstruction (higher is sharper) and optionally saves plots. Pass `--l-value` (the dataset's `L_value`, mm) whenever possible so the reconstruction happens at the plane-wave-equivalent depth `M*(L - z)` instead of the raw predicted depth. Note `--wavelength` is in meters (e.g. `4.05e-07` for the 405 nm laser), while the CSV records it in micrometers.
 
-# # Configuration
+### Scripts
+
+To use one of the scripts in `scripts/`, the entry point is not Holod directly, rather it is by invoking the `run` module:
+
+```sh
+uv run -m scripts.run -h
+```
+
+## Configuration
 
 Default training parameters reside in `train_settings.toml`. The config is
 **multi-model**: settings shared by every backbone (dataset, batch size, crop,

@@ -1,8 +1,33 @@
+"""Before/after ablation report for the random-crop and magnification fixes.
+
+Two pipeline fixes changed model quality and had no equivalent-metric record:
+
+1. The ``RandomResizedCrop`` training augmentation was removed (train-time fix).
+2. Focus evaluation of the reconstructed image now propagates at the
+   plane-wave-equivalent depth ``dlhm_effective_z_mm(z, L) = M * (L - z)``
+   instead of the raw predicted ``z`` (eval-time fix).
+
+``run_fix_ablation`` isolates each fix by training two models, one with the
+legacy random crop re-enabled and one with the current pipeline, and scoring
+both on the same seeded validation holograms at both reconstruction depths.
+That yields three conditions from two training runs (the two eval-time
+conditions share the current model) with every metric computed by the same
+current code: validation accuracy / MAE (mm), training losses, and the
+gradient-Tamura focus score of the reconstruction.
+
+Determinism: the global torch/numpy/random seed is reset identically before
+each training run, so both models share their weight initialization, the
+seeded train/val split, and DataLoader worker seeding. Training itself remains
+stochastic (the differing augmentation pipelines consume RNG differently, and
+cuDNN is nondeterministic on CUDA); repeated runs with different ``seed``
+values give error bars if needed.
+"""
+
 from __future__ import annotations
 
 import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, field
 from datetime import datetime
 
 # WARN: Path must be importable at runtime: pyserde wraps @serde class methods with
@@ -45,7 +70,6 @@ COND_AFTER = "after"
 
 
 @serde
-@dataclass
 class ConditionStats:
     """Metrics for one before/after condition of the two-fix ablation."""
 
@@ -68,7 +92,6 @@ class ConditionStats:
 
 
 @serde
-@dataclass
 class FixAblationReport:
     """Before/after metrics for the random-crop and magnification fixes."""
 
