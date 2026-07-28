@@ -60,6 +60,11 @@ typecheck:
 test:
 	uv run pytest -q --show-capture=stdout -m "not slow" $(TESTS)
 
+## Run tests and save results (also skips slow training tests)
+.PHONY: test-report
+test-report:
+	uv run pytest --junitxml=reports/test-results.xml -m "not slow" $(TESTS)
+
 ## Run slow tests (single-batch overfit per backbone)
 .PHONY: test-slow
 test-slow:
