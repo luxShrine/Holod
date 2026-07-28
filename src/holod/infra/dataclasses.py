@@ -638,14 +638,17 @@ class CoreTrainer:
 
     @property
     def device(self):
+        """Resolved torch device for this run."""
         return self.a_cfg.device()
 
     @property
     def analysis(self):
+        """Whether this run is classification or regression."""
         return self.a_cfg.analysis
 
     @property
     def backbone(self):
+        """Backbone this trainer was built for."""
         return self.a_cfg.backbone
 
     def get_std_avg(self, analysis: AnalysisType) -> tuple[Mean, StandardDev] | tuple[None, None]:
@@ -671,6 +674,7 @@ class CoreTrainer:
             raise Exception("z_avg, and z_std need to be used but are None.")
 
     def check_loss(self, labels_tens: Tensor, pred: Tensor):
+        """Coerce labels to the dtype/shape the configured loss function expects."""
         # TODO: this check is done every time, probably should set this once as an operation
         # to perform and reuse it
         if isinstance(self.loss_fn, nn.MSELoss):
@@ -805,6 +809,7 @@ class Checkpoint:
         )
 
     def torch_save(self, path) -> None:
+        """Write this checkpoint to ``path`` via ``torch.save``."""
         torch.save(
             asdict(self),
             path,
@@ -827,7 +832,8 @@ class ModelCheckpoint:
         np.ndarray,
         np.dtype,
         np.dtypes.Float64DType,
-        np._core.multiarray._reconstruct,  # numpy's ndarray pickle helper  # pyright: ignore[reportAttributeAccessIssue]
+        # numpy's ndarray pickle helper
+        np._core.multiarray._reconstruct,  # pyright: ignore[reportAttributeAccessIssue]
     ]
 
     @classmethod
@@ -841,6 +847,7 @@ class ModelCheckpoint:
         train_loss: float,
         val_loss: float,
     ) -> ModelCheckpoint:
+        """Bundle the end-of-epoch model, optimizer, and loss state into a checkpoint."""
         # Awlays save latest model, after going through both loaders
         checkpoint = Checkpoint.from_epoch(epoch, core_trainer, labels_tensor, val_metric)
         return cls(
@@ -882,6 +889,7 @@ class ModelCheckpoint:
         return ckpt
 
     def torch_save(self, path) -> None:
+        """Write this checkpoint plus optimizer/loss state to ``path``."""
         torch.save(
             asdict(self),
             path,

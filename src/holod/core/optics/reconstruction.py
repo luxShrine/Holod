@@ -181,26 +181,26 @@ def recon_inline(
     # if actual reference exists, use that instead of sqrt.
 
     # Input checking
-    I = np.asarray(intensity, dtype=np.float32)
+    inten = np.asarray(intensity, dtype=np.float32)
     if field0 is None:
         if reference is None:
-            if I.min() < 0:
+            if inten.min() < 0:
                 # shift if passed in high-pass or signed data
-                I = I - I.min()
+                inten = inten - inten.min()
             # if values are large, bring to [0,1]
-            if I.max() > 1.0:
-                logger.warning(f"Intensity measured at {I.max()}, rescaling back to [0,1]")
-                I = I / I.max()
-            field0 = np.sqrt(I).astype(np.complex64)
+            if inten.max() > 1.0:
+                logger.warning(f"Intensity measured at {inten.max()}, rescaling back to [0,1]")
+                inten = inten / inten.max()
+            field0 = np.sqrt(inten).astype(np.complex64)
         else:
             # normalize measured field relative to reference
             if np.isscalar(reference):
-                R = np.full_like(I, fill_value=reference, dtype=np.complex64)
+                R = np.full_like(inten, fill_value=reference, dtype=np.complex64)
             else:
                 R = np.asarray(reference, dtype=np.complex64)
 
             # from identity: I = |R+O|^2 -> estimate E = I/R
-            field0 = (I / np.abs(R)).astype(np.complex64)
+            field0 = (inten / np.abs(R)).astype(np.complex64)
 
     H0, W0 = field0.shape  # rows=y, cols=x
     if pad:

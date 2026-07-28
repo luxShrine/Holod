@@ -39,6 +39,7 @@ from holod.infra.util.types import SENSOR_PIXEL_PITCH_M
 
 
 def read_rows(csv_path: Path) -> list[dict[str, float | str]]:
+    """Read the metadata CSV, skipping rows whose image file is missing."""
     rows: list[dict[str, float | str]] = []
     with open(csv_path, newline="") as fh:
         for r in csv.DictReader(fh, delimiter=";"):
@@ -84,6 +85,11 @@ def sweep_one(
     z_grid_mm: np.ndarray,
     px_m: float,
 ) -> np.ndarray:
+    """Score one hologram at every depth in ``z_grid_mm``.
+
+    Each candidate depth is mapped through ``dlhm_effective_z_mm`` before
+    scoring, so the returned array is indexed by the *physical* depth grid.
+    """
     scores = np.empty(z_grid_mm.size)
     for j, z_mm in enumerate(z_grid_mm):
         z_eff_mm = dlhm_effective_z_mm(float(z_mm), l_mm)
@@ -102,7 +108,12 @@ def do_sweep(
     outdir: Path,
     seed: int = 42,
 ) -> None:
+    """Sweep focus score vs. depth for a stratified sample of holograms.
 
+    Writes a grid of per-hologram score curves plus the summary results to
+    ``outdir``. A hologram counts as recovered when its peak-scoring depth is
+    within ``tol_mm`` of the ground-truth depth.
+    """
     rows = read_rows(ds_root / csv_name)
     z_all = np.array([r["z_mm"] for r in rows])
     z_grid = np.linspace(

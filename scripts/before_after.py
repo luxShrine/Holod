@@ -1,4 +1,6 @@
-"""Outputs (200 dpi, ready to drop into the slide):
+"""Render the before/after comparison figure for the DLHM focus correction.
+
+Outputs (200 dpi, ready to drop into the slide):
     fig_before_after.png      -- side-by-side: sqrt(I) field at uncorrected z
                                  vs. DC-stripped contrast field at z_eff,
                                  each annotated with its gradient-Tamura score.
@@ -27,6 +29,12 @@ def run_before_after(
     dx_m: float,
     out: Path,
 ) -> None:
+    """Write the two-panel before/after figure for one hologram to ``out``.
+
+    The "before" panel reconstructs at the raw predicted depth ``z_pred_mm``;
+    the "after" panel reconstructs the DC-stripped contrast field at the
+    effective depth, and each panel is annotated with its gradient-Tamura score.
+    """
     # BEFORE: sqrt(I) field (DC term present), uncorrected geometry
     amp_before, _ = recon_inline(
         intensity, wavelength_m=wavelength_m, z_m=z_pred_mm * 1e-3, px_m=dx_m

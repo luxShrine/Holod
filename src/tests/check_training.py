@@ -8,6 +8,7 @@ from typing import NewType
 
 import numpy as np
 import polars as pl
+import pytest
 import torch
 from PIL import Image, ImageEnhance
 from PIL.Image import Image as ImageType
@@ -17,6 +18,7 @@ from torchvision import models
 
 import holod.infra.util.paths as paths
 from holod.infra.dataclasses import (
+    SAMPLE_PATH,
     AutoConfig,
     CoreTrainer,
     create_autofocus_model,
@@ -37,10 +39,12 @@ TEST_IMGS: Path = t_loc() / "images"
 
 # sanity check
 def f():
+    """Build the pair the sanity check below compares against."""
     return AutoConfig(num_workers=0), CoreTrainer
 
 
 def test_f():
+    """Sanity check that AutoConfig compares equal across constructions."""
     assert f() == (AutoConfig(num_workers=0), CoreTrainer)
 
 
@@ -144,6 +148,7 @@ def test_loader():
 
 
 def test_evaluation_metric_class():
+    """Accuracy is used for classification, MAE for regression."""
     # construct autoconfig
     auto_config_c = AutoConfig(num_workers=0, analysis=AnalysisType.CLASS)
     auto_config_r = AutoConfig(num_workers=0, analysis=AnalysisType.REG)
@@ -226,6 +231,7 @@ def test_soft_label_loss_selection():
 
 
 def test_model_creation():
+    """Every supported backbone builds without error."""
     # ModelType.NEW is mid-migration and not constructible yet, so it is
     # not covered here
     res = AutoConfig(backbone=ModelType.RESNET)
@@ -273,6 +279,10 @@ def test_backbone_static_stats():
     assert entry.throughput_img_per_s is not None and entry.throughput_img_per_s > 0
 
 
+@pytest.mark.skipif(
+    not SAMPLE_PATH.exists(),
+    reason=f"sample dataset not present at {SAMPLE_PATH}",
+)
 def test_compare_config_mapping():
     """Per-model TOML sections must map onto the selected backbone's AutoConfig.
 
@@ -338,6 +348,7 @@ def test_comparison_report_untrained():
 
 
 def test_paths():
+    """Path helpers resolve to the expected repo-relative locations."""
     src = paths.src_root()
     holo_root = paths.holo_root()
     reports = paths.report_path()
@@ -353,6 +364,7 @@ def test_paths():
 
 
 def test_image_processing():
+    """Cropping and image helpers produce the requested sizes."""
     import holod.infra.util.image_processing as ip
 
     # crop image
@@ -438,7 +450,7 @@ def test_image_processing():
 #     assert isinstance(config.to_auto_config(), AutoConfig)
 
 
-# TODO:
+# TODO: restore the label round-trip tests below
 # def test_labels():
 #
 #     # test each loader

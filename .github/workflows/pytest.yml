@@ -6,34 +6,82 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13"] # Test multiple versions
+    timeout-minutes: 10
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9
       with:
-        python-version: ${{ matrix.python-version }}
+        enable-cache: true
+
+    - name: Install lint tooling
+      # Only the dev group: ruff needs no torch, so this skips the heavy install.
+      run: uv sync --locked --only-group dev
+
+    - name: Ruff lint
+      run: uv run --no-sync ruff check --output-format=github
+
+    - name: Ruff format check
+      run: uv run --no-sync ruff format --check
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]  # project requires-python = ">=3.12"
+
+    env:
+      # uv provisions the interpreter itself; this overrides .python-version so
+      # the matrix actually tests different versions.
+      UV_PYTHON: ${{ matrix.python-version }}
+      # Never update the lockfile as a side effect of `uv run` in the makefile.
+      UV_FROZEN: "1"
+      # Picked up by the makefile's `TORCH_EXTRA ?= cu126`: CPU wheels only, since
+      # the runner has no GPU and the CUDA build pulls in GBs of nvidia-* packages.
+      TORCH_EXTRA: cpu
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9
+      with:
+        enable-cache: true
+
+    - name: Cache pretrained torchvision weights
+      uses: actions/cache@v6
+      with:
+        # test_model_creation builds ResNet50 / EfficientNet-B4 with IMAGENET1K_V1
+        # weights; without this they are re-downloaded on every run.
+        path: ~/.cache/torch
+        key: torch-hub-${{ runner.os }}
 
     - name: Install dependencies
-      run: |
-        make requirements
-        uv pip install pytest pytest-cov  # Ensures testing frameworks are present
+      run: uv sync --locked --extra "$TORCH_EXTRA"  # --locked: fail on lockfile drift
 
     - name: Run tests with pytest
-      run: |
-        make test-report
+      run: make test-report
 
     - name: Upload test results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: pytest-results-${{ matrix.python-version }}
         path: reports/test-results.xml
-      if: always() # Uploads even if tests fail
+        if-no-files-found: warn
+      if: always()  # Uploads even if tests fail

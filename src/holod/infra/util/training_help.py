@@ -39,6 +39,8 @@ type TrainStatus = TrainImprovement | None
 
 @dataclass
 class TrainImprovement:
+    """Outcome of an improvement check: the running best metric and whether to checkpoint."""
+
     best_val: float
     save_best: bool
 
@@ -55,6 +57,13 @@ class TrainImprovement:
         short_range: int = 3,
         long_range: int = 5,
     ) -> TrainStatus:
+        """Decide whether the epoch improved on ``best_val`` and whether to stop early.
+
+        Direction depends on the analysis type (lower MAE is better for
+        regression, higher accuracy for classification); early stopping is
+        driven by the percent-difference history over ``short_range`` and
+        ``long_range`` epochs.
+        """
         epoch_count = core_trainer.a_cfg.epoch_count
         if core_trainer.analysis == AnalysisType.REG:
             # Lower MAE is better
@@ -133,6 +142,7 @@ def get_percent_diff_history(
 
 
 def init_epoch(core_trainer: CoreTrainer, device: str):
+    """Build the zeroed accumulators one epoch needs (metric, error sums, bin centers)."""
     epoch_metric: EpochMetric = EpochMetric()
     abs_err_sum: int | float = 0
     total_samples_for_metric: int = 0  # Denominator for MAE/Accuracy
@@ -153,6 +163,7 @@ def init_epoch(core_trainer: CoreTrainer, device: str):
 
 
 def init_training(core_trainer: CoreTrainer, ckpt: ModelCheckpoint | None):
+    """Seed the training state, resuming from ``ckpt`` when one is supplied."""
     if ckpt is None:
         labels_tensor: Tensor = torch.empty([1, 1])
         epoch_metric: EpochMetric = EpochMetric(metric_val=0)

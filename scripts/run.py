@@ -16,6 +16,7 @@ from .validation_sweep import do_sweep
 
 
 def main() -> None:
+    """Parse CLI arguments and dispatch to the figure/sweep generators."""
     p = argparse.ArgumentParser(description=__doc__)
     # before/after related
     p.add_argument("hologram", help="path to a hologram image")

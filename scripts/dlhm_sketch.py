@@ -1,4 +1,6 @@
-"""Outputs:
+"""Draw the DLHM point-source geometry sketch used in the slides.
+
+Outputs:
 fig_geometry_sketch.png   -- DLHM point-source geometry + z_eff formula.
 """
 
@@ -8,6 +10,7 @@ import matplotlib.pyplot as plt
 
 
 def geometry_sketch(out: Path) -> None:
+    """Write the schematic of the source/sample/sensor geometry to ``out``."""
     fig, ax = plt.subplots(figsize=(7, 3.4))
     # positions along the optical axis (schematic, not to scale)
     src, sample, sensor = 0.0, 3.0, 9.0

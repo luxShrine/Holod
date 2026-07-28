@@ -6,6 +6,13 @@ PROJECT_NAME := holod
 PYTHON_VERSION := 3.13
 PYTHON_INTERPRETER := python
 
+# Which torch build to install: cu126 (CUDA) or cpu. These are mutually
+# exclusive extras, so one must always be selected -- otherwise `uv run`
+# re-syncs the environment without torch. Override per-invocation:
+#   make test TORCH_EXTRA=cpu
+TORCH_EXTRA ?= cu126
+UV_RUN := uv run --extra $(TORCH_EXTRA)
+
 # Directories
 SRC_DIR      := src
 TESTS     	 := $(SRC_DIR)/tests/check_training.py $(SRC_DIR)/tests/check_dataset_config.py $(SRC_DIR)/tests/check_overfit.py
@@ -19,7 +26,7 @@ BUILD_DIRS   := build dist .pytest_cache .ruff_cache .mypy_cache .coverage htmlc
 ## Install Python dependencies (sync lock + install)
 .PHONY: requirements
 requirements:
-	uv sync	
+	uv sync --extra $(TORCH_EXTRA)
 
 ## Delete all checkpoints, reports
 .PHONY: clear
@@ -41,39 +48,39 @@ clean:
 .PHONY: bump-deps
 bump-deps:
 	uv lock --upgrade
-	uv sync
+	uv sync --extra $(TORCH_EXTRA)
 
 
 ## Format code (apply fixes)
 .PHONY: format
 format:
-	uv run ruff check --fix
-	uv run ruff format
+	$(UV_RUN) ruff check --fix
+	$(UV_RUN) ruff format
 
 ## Static type checking 
 .PHONY: typecheck
 typecheck:
-	uv run mypy $(SRC_DIR) || true
+	$(UV_RUN) mypy $(SRC_DIR) || true
 
 ## Run tests (skips slow training tests)
 .PHONY: test
 test:
-	uv run pytest -q --show-capture=stdout -m "not slow" $(TESTS)
+	$(UV_RUN) pytest -q --show-capture=stdout -m "not slow" $(TESTS)
 
 ## Run tests and save results (also skips slow training tests)
 .PHONY: test-report
 test-report:
-	uv run pytest --junitxml=reports/test-results.xml -m "not slow" $(TESTS)
+	$(UV_RUN) pytest --junitxml=reports/test-results.xml -m "not slow" $(TESTS)
 
 ## Run slow tests (single-batch overfit per backbone)
 .PHONY: test-slow
 test-slow:
-	uv run pytest -q -m slow $(TESTS)
+	$(UV_RUN) pytest -q -m slow $(TESTS)
 
 ## Run tests with coverage HTML report
 .PHONY: coverage
 coverage:
-	uv run pytest --cov=$(SRC_DIR) --cov-report=term-missing --cov-report=html $(TESTS)
+	$(UV_RUN) pytest --cov=$(SRC_DIR) --cov-report=term-missing --cov-report=html $(TESTS)
 	@echo "Open htmlcov/index.html"
 
 ## Set up Python interpreter environment
@@ -98,28 +105,28 @@ check: requirements typecheck test
 ## Train model 
 .PHONY: train
 train: requirements
-	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py train
+	$(UV_RUN) $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py train
 
 ## Compare model backbones under one shared configuration
 .PHONY: compare
 compare: requirements
-	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py compare
+	$(UV_RUN) $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py compare
 
 ## Generate plots
 .PHONY: plot
 plot: requirements
-	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py plot-train
+	$(UV_RUN) $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py plot-train
 
 ## Train and plot
 .PHONY: do
 do: requirements
-	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py train
-	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py plot-train
+	$(UV_RUN) $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py train
+	$(UV_RUN) $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py plot-train
 
 ## Preform Reconstruction on sample data
 .PHONY: recon
 recon: requirements
-	uv run $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py reconstruction "./src/data/MW_Dataset_Sample/405/10_Skeletal_muscle/z15/1.bmp"
+	$(UV_RUN) $(PYTHON_INTERPRETER) $(SRC_DIR)/holod/cli.py reconstruction "./src/data/MW_Dataset_Sample/405/10_Skeletal_muscle/z15/1.bmp"
 
 
 #################################################################################

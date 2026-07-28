@@ -7,21 +7,29 @@ import torch.nn.functional as F
 
 
 def physics_informed_loss(loss_fn: Any, prediction: float, label: float):
+    """Combine a numeric loss with a reconstruction-based physics term.
+
+    Not implemented yet: the reconstruction terms are still placeholder noise.
+    """
     # TODO: implement basic idea of being aware of the physics:
     # calculate the reconstruction of the prediction depth
     # calculate the reconstruction of the true depth
     # calculate metric, what metric, focus, tamara coeff?
 
     # H(fx,fy) = exp(i k z) * exp(-i π λ z (fx^2 + fy^2))
-    prediction_recon = np.random.random((5, 5))
-    label_recon = np.random.random((5, 5))
+    rng = np.random.default_rng()
+    prediction_recon = rng.random((5, 5))
+    label_recon = rng.random((5, 5))
     phy_loss = np.sqrt((prediction_recon**2) - (label_recon**2))
     num_loss = loss_fn(prediction, label)
     return phy_loss + num_loss
 
 
 class NeuralNetwork(nn.Module):
+    """Plain four-block single-channel CNN classifier (the ``PCNN`` backbone)."""
+
     def __init__(self, in_channels, num_classes=10):
+        """Build the conv/pool stack for ``in_channels`` inputs and ``num_classes`` outputs."""
         super().__init__()
         # conv2d (ks=3, s=1) -> (N, OC, h - 2, w - 2)
         self.conv1 = nn.Conv2d(in_channels, 64, 3, 1)
@@ -38,6 +46,7 @@ class NeuralNetwork(nn.Module):
         self.fc2 = nn.Linear(128, num_classes)
 
     def forward(self, x):
+        """Return log-softmax class scores for a batch of holograms."""
         x = F.relu(self.conv1(x))  # -> (N, 64, h-2, w-2)
         x = F.relu(self.conv2(x))  # -> (N, 128, h-4, w-4)
         x = F.relu(self.conv3(x))  # -> (N, 256, h-2, w-2)
@@ -87,6 +96,8 @@ def make_input_2ch(holod: torch.Tensor, use_fft: bool = True) -> torch.Tensor:
 
     Args:
         holod: (N, 1, H, W) real hologram.
+        use_fft: when ``True`` the second channel is the log-magnitude spectrum
+            from :func:`fft_mag2d`; when ``False`` the hologram is duplicated.
 
     """
     assert holod.ndim == 4 and holod.size(1) == 1, "expect (N,1,H,W)"
@@ -102,7 +113,10 @@ def make_input_2ch(holod: torch.Tensor, use_fft: bool = True) -> torch.Tensor:
 
 
 class ConvBlock(nn.Module):
+    """Conv -> BatchNorm -> ReLU block; padding defaults to "same" for odd ``k``."""
+
     def __init__(self, c_in: int, c_out: int, k: int = 3, s: int = 1, p: int | None = None):
+        """Build the block; ``p=None`` picks ``k // 2`` so the spatial size is preserved."""
         super().__init__()
         p = (k // 2) if p is None else p
         self.conv = nn.Conv2d(c_in, c_out, k, s, p, bias=False)
@@ -110,6 +124,7 @@ class ConvBlock(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the conv/norm/activation stack to ``x``."""
         return self.act(self.bn(self.conv(x)))
 
 
@@ -129,6 +144,7 @@ class FocusNetTorch(nn.Module):
         head: Literal["mlp", "linear"] = "mlp",
         dropout: float = 0.2,
     ) -> None:
+        """Build the backbone; ``num_classes=1`` gives the regression head."""
         super().__init__()
         self.use_fft = use_fft
 

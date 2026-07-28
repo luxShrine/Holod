@@ -32,11 +32,23 @@ dependencies = [
   "scipy>=1.15.2",
   "statsmodels>=0.14.4",
   "timm>=1.0.15",
-  "torch>=2.6",
-  "torchvision>=0.21",
 ]
 
 scripts.holod = "holod.cli:cli"
+
+# torch/torchvision are not direct dependencies: they are pulled in through
+# exactly one of the mutually exclusive `cpu` / `cu126` extras below, so the
+# build variant is an explicit choice rather than a property of the machine.
+# Select one at sync time: `uv sync --extra cu126` (or `--extra cpu`).
+[project.optional-dependencies]
+cpu = [
+  "torch>=2.6",
+  "torchvision>=0.21",
+]
+cu126 = [
+  "torch>=2.6",
+  "torchvision>=0.21",
+]
 
 [tool.setuptools]
 package-dir = { "" = "src" } # everything lives in src/
@@ -44,9 +56,28 @@ package-dir = { "" = "src" } # everything lives in src/
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cu126" },
+  ],
+]
+
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu126" }]
-torchvision = [{ index = "pytorch-cu126" }]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "cu126" },
+]
+torchvision = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "cu126" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

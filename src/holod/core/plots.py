@@ -57,6 +57,8 @@ class PlotMeta:
 
 @dataclass
 class PlotCollection:
+    """A single rendered figure paired with the metadata describing it."""
+
     meta: PlotMeta
     figure: go.Figure
 
@@ -78,6 +80,7 @@ class PlotPred:
     repeat_config: TrainingRepeatConfig
 
     def save_to_file(self):
+        """Serialize the predictions to a timestamped JSON file under ``reports/``."""
         # backbone + full date in the name: back-to-back runs (e.g. `holod compare`
         # training several backbones) must not overwrite each other's predictions
         backbone = self.repeat_config.user_config.train.backbone or "unknown"
@@ -90,6 +93,7 @@ class PlotPred:
 
     @classmethod
     def load_from_file(cls, path_to_file: Path):
+        """Rebuild a ``PlotPred`` from a JSON file written by :meth:`save_to_file`."""
         json_s = path_to_file.read_text()
         return from_json(cls, json_s)
 
@@ -575,6 +579,12 @@ class PlotPred:
         z_avg_mm: float | None = None,
         z_std_mm: float | None = None,
     ) -> PlotPred:
+        """Run the trained model over the validation loader and collect z predictions.
+
+        Classification predictions are mapped back to physical depths through
+        ``bin_centers``; regression predictions are de-normalized with
+        ``z_avg_mm``/``z_std_mm``. Both are returned in mm.
+        """
         device = core_trainer.device
         _: nn.Module = (
             core_trainer.model.eval()

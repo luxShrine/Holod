@@ -33,6 +33,14 @@ from holod.infra.util.types import AnalysisType, ModelType
 CSV_NAME = "meta.csv"
 NUM_IMAGES = 32
 
+# The bundled MW_Dataset_Sample is ~36 GB and gitignored, so any test that takes
+# the "use sample data" branch of resolve_paths() can only run on a machine that
+# has downloaded it. Skipping keeps CI green instead of failing on missing data.
+requires_sample_data = pytest.mark.skipif(
+    not SAMPLE_PATH.exists(),
+    reason=f"sample dataset not present at {SAMPLE_PATH}",
+)
+
 
 def _ban_user_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail the test if any interactive click prompt fires."""
@@ -215,6 +223,7 @@ def test_resolve_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert cfg.resolve_paths().paths.meta_csv_name == first == csv_path.as_posix()
 
 
+@requires_sample_data
 def test_resolve_sample_flag_skips_dataset_checks(monkeypatch: pytest.MonkeyPatch):
     """--sample uses the bundled sample CSV and never prompts."""
     _ban_user_prompts(monkeypatch)
@@ -223,6 +232,7 @@ def test_resolve_sample_flag_skips_dataset_checks(monkeypatch: pytest.MonkeyPatc
     assert cfg.to_auto_config(ModelType.ENET).meta_csv_strpath == SAMPLE_PATH.as_posix()
 
 
+@requires_sample_data
 def test_regression_analysis(monkeypatch: pytest.MonkeyPatch):
     """A single class selects regression analysis."""
     _ban_user_prompts(monkeypatch)
@@ -379,7 +389,9 @@ def test_split_by_sample_keeps_groups_apart():
 
 def test_split_by_sample_needs_multiple_groups():
     """A dataset with a single sample group cannot be split sample-wise."""
-    rel_paths = [f"./MW-Dataset/405/1_Reticulos/z{z}/{i}.jpg" for z in range(1, 7) for i in range(6)]
+    rel_paths = [
+        f"./MW-Dataset/405/1_Reticulos/z{z}/{i}.jpg" for z in range(1, 7) for i in range(6)
+    ]
     n = len(rel_paths)
     df = pl.DataFrame(
         [
@@ -394,6 +406,7 @@ def test_split_by_sample_needs_multiple_groups():
         _ = cfg.setup_loader_indices(ds)
 
 
+@requires_sample_data
 def test_split_by_sample_flag_reaches_auto_config(monkeypatch: pytest.MonkeyPatch):
     """The flags.split_by_sample toggle flows through to the runtime AutoConfig."""
     _ban_user_prompts(monkeypatch)

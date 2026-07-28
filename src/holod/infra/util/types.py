@@ -59,6 +59,7 @@ class AnalysisType(Enum):
 
     @staticmethod
     def determine(num_classes: int):
+        """Return ``REG`` for a single output, ``CLASS`` for binned depths."""
         if num_classes == 1:
             return AnalysisType.REG
         return AnalysisType.CLASS
@@ -90,6 +91,7 @@ class UserDevice(Enum):
 
     @staticmethod
     def determine(desired_device: str = "cuda"):
+        """Resolve the requested device, falling back to CPU when CUDA is unavailable."""
         if desired_device == "cpu":
             device = UserDevice.CPU
         elif desired_device == "cuda":
@@ -117,6 +119,7 @@ class ModelType(Enum):
 
     @classmethod
     def from_str(cls, backbone: str):
+        """Parse a backbone name leniently (substring match, case-insensitive)."""
         backbone = backbone.lower()
         if "vit" in backbone:
             return ModelType.VIT
