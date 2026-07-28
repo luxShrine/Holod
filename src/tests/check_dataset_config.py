@@ -33,7 +33,7 @@ from holod.infra.util.types import AnalysisType, ModelType
 CSV_NAME = "meta.csv"
 NUM_IMAGES = 32
 
-# The bundled MW_Dataset_Sample is ~36 GB and gitignored, so any test that takes
+# The expected MW_Dataset_Sample is ~36 GB and gitignored, so any test that takes
 # the "use sample data" branch of resolve_paths() can only run on a machine that
 # has downloaded it. Skipping keeps CI green instead of failing on missing data.
 requires_sample_data = pytest.mark.skipif(
@@ -122,6 +122,7 @@ def test_resolve_name_under_data_root():
     assert paths.resolve_dataset_root("MW_Dataset_Sample") == expected
 
 
+@requires_sample_data
 def test_resolve_repo_root_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Repo-relative paths (as in the README) work from any working directory."""
     monkeypatch.chdir(tmp_path)  # ensure the cwd candidate cannot match
