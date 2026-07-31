@@ -85,3 +85,62 @@ jobs:
         path: reports/test-results.xml
         if-no-files-found: warn
       if: always()  # Uploads even if tests fail
+
+  db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: holod_db
+        ports:
+          - 5432:5432
+        # The job's first step can otherwise start before Postgres accepts connections.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      UV_LOCKED: "1"
+      # The makefile's db targets use a bare `uv run`, which would otherwise re-sync
+      # and install the project -- and timm drags in torch, which this job avoids.
+      UV_NO_SYNC: "1"
+      # The project itself is not installed here (see the sync step), so holod is
+      # imported straight from the source tree.
+      PYTHONPATH: src
+      # Turns "no database reachable" from a skip into a failure: in this job an
+      # unreachable server is a broken workflow, not a missing optional dependency.
+      HOLOD_REQUIRE_DB: "1"
+      DATABASE_USER: postgres
+      DATABASE_PASS: postgres
+      DATABASE_HOST: localhost
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: holod_db
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+      with:
+        enable-cache: true
+
+    - name: Install database tooling
+      # Only the dev group (which includes the db group): psycopg and alembic need no
+      # torch, and --only-group omits the project, so this skips the multi-GB install.
+      run: uv sync --only-group dev
+
+    - name: Build the schema under test
+      # Runs the real migration chain, so the test schema is the production schema
+      # and a broken migration fails here.
+      run: make db-migrate
+
+    - name: Run database tests
+      run: make test-db
