@@ -5,7 +5,7 @@ from pathlib import Path
 
 from holod.cli import TRAIN_SETTINGS_STR
 from holod.core.optics.reconstruction import load_intensity
-from holod.infra.dataclasses import CompareUserConfig, Flags
+from holod.infra.data import CompareUserConfig, Flags
 from holod.infra.util.prog_helper import console
 from holod.infra.util.types import ModelType
 

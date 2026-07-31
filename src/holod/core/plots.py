@@ -24,7 +24,7 @@ from serde import serde
 from serde.json import from_json, to_json
 from sklearn.metrics import confusion_matrix
 
-from holod.infra.dataclasses import CoreTrainer, TrainingOutput, TrainingRepeatConfig
+from holod.infra.data import CoreTrainer, TrainingOutput, TrainingRepeatConfig
 from holod.infra.log import get_logger
 from holod.infra.util.paths import report_path
 from holod.infra.util.prog_helper import track_progress

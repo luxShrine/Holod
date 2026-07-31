@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from holod.infra.util.prog_helper import ProgressLike
 
 from holod.core.plots import PlotPred
-from holod.infra.dataclasses import (
+from holod.infra.data import (
     AutoConfig,
     CoreTrainer,
     EpochMetric,

@@ -58,7 +58,7 @@ from holod.infra.util.paths import checkpoints_loc, report_path
 from holod.infra.util.types import SENSOR_PIXEL_PITCH_M, AnalysisType
 
 if TYPE_CHECKING:
-    from holod.infra.dataclasses import CompareUserConfig, TrainingOutput
+    from holod.infra.data import CompareUserConfig, TrainingOutput
     from holod.infra.util.types import ModelType
 
 logger = get_logger(__name__)

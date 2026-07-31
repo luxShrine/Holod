@@ -19,7 +19,7 @@ import pytest
 import torch
 from check_training import create_test_dataset
 
-from holod.infra.dataclasses import AutoConfig, CoreTrainer, create_training_setup
+from holod.infra.data import AutoConfig, CoreTrainer, create_training_setup
 from holod.infra.util.training_help import overfit_single_batch
 from holod.infra.util.types import AnalysisType, ModelType, UserDevice
 

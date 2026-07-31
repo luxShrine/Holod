@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torchvision import models
 
 import holod.infra.util.paths as paths
-from holod.infra.dataclasses import (
+from holod.infra.data import (
     SAMPLE_PATH,
     AutoConfig,
     CoreTrainer,
@@ -291,7 +291,7 @@ def test_compare_config_mapping():
     """
     import pytest
 
-    from holod.infra.dataclasses import CompareUserConfig, Flags, ModelConfig, Paths, Train
+    from holod.infra.data import CompareUserConfig, Flags, ModelConfig, Paths, Train
 
     cfg = CompareUserConfig(
         paths=Paths.empty(),
@@ -417,7 +417,7 @@ def test_image_processing():
 
 # def test_loading_config():
 #     from serde.toml import from_toml
-# from holod.infra.dataclasses import (
+# from holod.infra.data import (
 #     Flags,
 #     Paths,
 #     Train,

@@ -17,7 +17,7 @@ import pytest
 from PIL import Image
 
 import holod.infra.util.paths as paths
-from holod.infra.dataclasses import (
+from holod.infra.data import (
     SAMPLE_PATH,
     AutoConfig,
     CompareUserConfig,

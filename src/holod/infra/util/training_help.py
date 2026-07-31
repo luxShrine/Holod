@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from holod.infra.dataclasses import (
+from holod.infra.data import (
     Checkpoint,
     CompareUserConfig,
     CoreTrainer,

@@ -8,7 +8,7 @@ import torch.nn as nn
 from PIL import Image
 from torchvision.transforms import v2
 
-from holod.infra.dataclasses import AutoConfig, create_autofocus_model
+from holod.infra.data import AutoConfig, create_autofocus_model
 from holod.infra.log import get_logger
 from holod.infra.util.image_processing import crop_max_square
 from holod.infra.util.types import (

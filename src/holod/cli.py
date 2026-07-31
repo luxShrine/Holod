@@ -6,7 +6,7 @@ import click
 import numpy.typing as npt
 from click.core import ParameterSource
 
-from holod.infra.dataclasses import CompareUserConfig
+from holod.infra.data import CompareUserConfig
 from holod.infra.log import get_logger, init_logging
 from holod.infra.util.paths import (
     checkpoints_loc,
@@ -200,7 +200,7 @@ def train(
     relative to the current directory, or an absolute path anywhere on disk.
     When omitted, the dataset_root from train_settings.toml is used.
     """
-    from holod.infra.dataclasses import (
+    from holod.infra.data import (
         AutoConfig,
         CompareUserConfig,
         Flags,
@@ -381,7 +381,7 @@ def compare(
 ) -> None:
     """Compare each configured model backbone under the shared configuration."""
     from holod.core.compare import compare_backbones
-    from holod.infra.dataclasses import CompareUserConfig, Flags, Paths
+    from holod.infra.data import CompareUserConfig, Flags, Paths
     from holod.infra.log import console_ as console
     from holod.infra.util.types import DisplayType
 
@@ -789,7 +789,7 @@ def determine_lr(
     sample: bool,
 ) -> None:
     """Report the performance of a model across various learning rates."""
-    from holod.infra.dataclasses import Flags, Paths
+    from holod.infra.data import Flags, Paths
     from holod.infra.util.training_help import determine_learning_rate
 
     train_settings = Path(TRAIN_SETTINGS_STR)

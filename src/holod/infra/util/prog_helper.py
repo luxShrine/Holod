@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from rich.progress import Task
 
-    from holod.infra.dataclasses import CoreTrainer
+    from holod.infra.data import CoreTrainer
 
 # used to help align items that are printed, allows for one central area of control
 ALIGN: str = "\t  "

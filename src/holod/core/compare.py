@@ -20,7 +20,7 @@ from torchvision.transforms import v2
 
 from holod.core.optics.reconstruction import dlhm_effective_z_mm, focus_score
 from holod.core.plots import PlotPred
-from holod.infra.dataclasses import (
+from holod.infra.data import (
     AutoConfig,
     Checkpoint,
     CompareUserConfig,
