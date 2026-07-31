@@ -140,6 +140,9 @@ ignore = [
   "ISC003", # Implicit string concatenation
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"migrations/**" = ["E501", "D103"]
+
 [tool.basedpyright]
 pythonVersion = "3.12"
 typeCheckingMode = "standard" # off, basic, standard, strict, recommended, all 

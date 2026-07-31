@@ -6,6 +6,19 @@ rev = "v6.0.0"
 hooks = [{ id = "check-yaml" }, { id = "end-of-file-fixer" }]
 
 [[repos]]
-repo = "https://github.com/astral-sh/ruff-pre-commit"
-rev = "v0.8.4"
-hooks = [{ id = "ruff", args = ["--fix"] }]
+repo = "local"
+hooks = [
+  # Run the linter.
+  { name = "ruff check", id = "ruff-check", entry = "uv run ruff check", language = "system", args = [
+    "--fix",
+  ], types_or = [
+    "python",
+    "pyi",
+  ] },
+
+  # Run the formatter.
+  { name = "ruff format", id = "ruff-format", entry = "uv run ruff format", language = "system", types_or = [
+    "python",
+    "pyi",
+  ] },
+]
