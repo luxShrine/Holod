@@ -17,14 +17,15 @@ dependencies = [
   "beartype>=0.21",
   "click>=8.1,<8.2",
   "dash>=3.0.4",
+  "dotenv>=0.9.9",
   "kaleido>=1.0.0",
-  "lightning>=2.5.2",
   "matplotlib>=3.10.1",
   "numpy>=2.2.4",
   "pillow>=11.2.1",
   "plotly>=6.0.1",
   "plotly-stubs>=0.0.5",
   "polars>=1.27.1",
+  "psycopg[binary]>=3.3.4",
   "pyserde[all]>=0.24.0",
   "python-json-logger>=3.3.0",
   "rich>=13.6",
@@ -41,14 +42,8 @@ scripts.holod = "holod.cli:cli"
 # build variant is an explicit choice rather than a property of the machine.
 # Select one at sync time: `uv sync --extra cu126` (or `--extra cpu`).
 [project.optional-dependencies]
-cpu = [
-  "torch>=2.6",
-  "torchvision>=0.21",
-]
-cu126 = [
-  "torch>=2.6",
-  "torchvision>=0.21",
-]
+cpu = ["torch>=2.6", "torchvision>=0.21"]
+cu126 = ["torch>=2.6", "torchvision>=0.21"]
 
 [tool.setuptools]
 package-dir = { "" = "src" } # everything lives in src/
@@ -57,12 +52,7 @@ package-dir = { "" = "src" } # everything lives in src/
 where = ["src"]
 
 [tool.uv]
-conflicts = [
-  [
-    { extra = "cpu" },
-    { extra = "cu126" },
-  ],
-]
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }]]
 
 [tool.uv.sources]
 torch = [
@@ -160,9 +150,14 @@ reportCallInDefaultInitializer = "none"
 [tool.pytest.ini_options]
 markers = [
   "slow: long-running tests (e.g. single-batch overfit training); deselect with -m \"not slow\"",
+  "db: needs a reachable Postgres; skipped when there is none, unless HOLOD_REQUIRE_DB=1",
 ]
 
 [dependency-groups]
+# psycopg and dotenv are also main dependencies; they are repeated here so that
+# `uv sync --only-group dev` -- which omits the project, and with it timm and torch --
+# still installs enough to run the database tests and alembic in CI.
+db = ["alembic", "psycopg[binary]>=3.3.4", "dotenv>=0.9.9"]
 dev = [
   "line-profiler>=4.2",
   "mypy>=1.17.1",
@@ -171,4 +166,5 @@ dev = [
   "ruff>=0.11.7",
   "scipy-stubs>=1.16.1.1",
   "ty>=0.0.1a6",
+  { include-group = "db" },
 ]

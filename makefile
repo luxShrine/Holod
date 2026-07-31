@@ -15,7 +15,8 @@ UV_RUN := uv run --extra $(TORCH_EXTRA)
 
 # Directories
 SRC_DIR      := src
-TESTS     	 := $(SRC_DIR)/tests/check_training.py $(SRC_DIR)/tests/check_dataset_config.py $(SRC_DIR)/tests/check_overfit.py
+DB_TESTS     := $(SRC_DIR)/tests/check_database.py
+TESTS     	 := $(SRC_DIR)/tests/check_training.py $(SRC_DIR)/tests/check_dataset_config.py $(SRC_DIR)/tests/check_overfit.py $(DB_TESTS)
 BUILD_DIRS   := build dist .pytest_cache .ruff_cache .mypy_cache .coverage htmlcov
 
 #################################################################################
@@ -49,7 +50,6 @@ clean:
 bump-deps:
 	uv lock --upgrade
 	uv sync --extra $(TORCH_EXTRA)
-
 
 ## Format code (apply fixes)
 .PHONY: format
@@ -95,6 +95,45 @@ create_environment:
 ## One command that does requirements, lint, typecheck, and test
 .PHONY: check
 check: requirements typecheck test
+
+#################################################################################
+# PROJECT DATABASE                                                              #
+#################################################################################
+
+## start the local Postgres used by the database tests
+.PHONY: db-up
+db-up:
+	docker compose up -d db
+
+## stop the local Postgres
+.PHONY: db-down
+db-down:
+	docker compose down
+
+## run only the database tests (needs no torch, so plain `uv run`)
+.PHONY: test-db
+test-db:
+	uv run pytest -q $(DB_TESTS)
+
+## migrate db to latest schema
+.PHONY: db-migrate
+db-migrate:
+	uv run alembic upgrade head
+
+## create blank revision with some message
+.PHONY: db-revision
+db-revision:
+	uv run alembic revision -m "$(m)"
+
+## check what version the database is
+.PHONY: db-current
+db-current:
+	uv run alembic current
+
+## runs sql command without executing it
+.PHONY: db-sql
+db-sql:
+	uv run alembic upgrade head --sql
 	
 
 #################################################################################
