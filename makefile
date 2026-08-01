@@ -16,7 +16,7 @@ UV_RUN := uv run --extra $(TORCH_EXTRA)
 # Directories
 SRC_DIR      := src
 DB_TESTS     := $(SRC_DIR)/tests/check_database.py
-TESTS     	 := $(SRC_DIR)/tests/check_training.py $(SRC_DIR)/tests/check_dataset_config.py $(SRC_DIR)/tests/check_overfit.py $(DB_TESTS)
+TESTS     	 := $(SRC_DIR)/tests/verbose_tests/check_training.py $(SRC_DIR)/tests/verbose_tests/check_dataset_config.py $(SRC_DIR)/tests/verbose_tests/check_overfit.py $(DB_TESTS)
 BUILD_DIRS   := build dist .pytest_cache .ruff_cache .mypy_cache .coverage htmlcov
 
 #################################################################################
