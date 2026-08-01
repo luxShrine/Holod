@@ -25,7 +25,7 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, LiteralString
 
 import psycopg
 import pytest
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 GIT_COMMIT = "a" * 40  # run.git_commit is CHAR(40); short values would be blank-padded
 CONFIG_HASH = "b" * 64  # run.config_hash is CHAR(64)
-CONFIG = '{"lr": 0.0001}'  # run.config is JSONB, so this has to parse as JSON
+CONFIG = {"lr": 0.0001}  # run.config is JSONB, so this has to parse as JSON
 DIGEST = bytes(32)  # hologram.sha256 is CHECK (octet_length(sha256) = 32)
 
 
@@ -112,7 +112,7 @@ def column_rows(db: HolodDatabase, table: str) -> set[tuple[str, str, str]]:
     return {(str(c), str(t), str(n)) for c, t, n in rows}
 
 
-def one_row(db: HolodDatabase, stmt: str, data: tuple[Any, ...] = ()) -> Any:
+def one_row(db: HolodDatabase, stmt: LiteralString, data: tuple[Any, ...] = ()) -> Any:
     """Run a query expected to produce exactly one row and return that row."""
     row = db.conn.execute(stmt, data).fetchone()
     assert row is not None, f"expected one row from: {stmt}"
@@ -393,11 +393,12 @@ def test_register_dataset_default_created_at(clean_db: HolodDatabase) -> None:
 
 def test_insert_run_defaults(clean_db: HolodDatabase) -> None:
     """started_at=None and status=None yield whatever the column DEFAULTs would."""
+    jsonb_config = database._convert_dict_jsonb(CONFIG)
     expected = one_row(
         clean_db,
         "INSERT INTO run (git_commit, config_hash, config) VALUES (%s, %s, %s) "
         "RETURNING started_at, status;",
-        (GIT_COMMIT, CONFIG_HASH, CONFIG),
+        (GIT_COMMIT, CONFIG_HASH, jsonb_config),
     )
     run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
     actual = one_row(clean_db, "SELECT started_at, status FROM run WHERE id = %s;", (run_id,))
@@ -532,9 +533,12 @@ def test_autocommit_persists_without_transaction(db: HolodDatabase) -> None:
 
         # A second, independent connection can only see committed rows.
         with DBCredentials().connect() as other:
-            (count,) = other.execute(
+            count = 0
+            res = other.execute(
                 "SELECT count(*) FROM dataset WHERE name = %s;", (marker,)
             ).fetchone()
+            if res is not None:
+                (count,) = res
         assert count == 1, "the insert was never committed"
     finally:
         db.conn.execute("DELETE FROM dataset WHERE name = %s;", (marker,))

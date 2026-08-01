@@ -18,6 +18,10 @@ def _get_env_or_user(key: str) -> str:
     return input(f"{key}? ")
 
 
+def _convert_dict_jsonb(config: dict):
+    return psycopg.types.json.Jsonb(config)  # pyright: ignore[reportAttributeAccessIssue]
+
+
 class DBCredentials:
     """Database credentials, fetched from the environment.
 
@@ -226,12 +230,13 @@ class HolodDatabase:
         self,
         git_commit: str,
         config_hash: str,
-        config: str,
+        config: dict,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
         status: str | None = None,
     ) -> int:
         """Insert a new training run row."""
+        json_config = _convert_dict_jsonb(config)
         # started_at and status have NOT NULL DEFAULTs; COALESCE reproduces them for the
         # None cases. finished_at is nullable with no default, so None passes through.
         stmt = (
@@ -241,7 +246,7 @@ class HolodDatabase:
             "RETURNING id;"
         )
         return self._execute_returning_id(
-            stmt, (git_commit, config_hash, config, started_at, finished_at, status)
+            stmt, (git_commit, config_hash, json_config, started_at, finished_at, status)
         )
 
     def insert_prediction(
