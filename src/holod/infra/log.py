@@ -6,6 +6,7 @@ import atexit
 import logging
 import logging.config
 import logging.handlers as lh
+import os
 import queue
 import time
 from contextlib import contextmanager
@@ -22,6 +23,9 @@ from rich.traceback import install
 
 _LOG_FILE: Final[Path] = Path("logs/holo_log.jsonl")
 _LOG_LEVEL = "DEBUG"  # root level – override per logger if needed
+# Console-only threshold; the JSON file handler always keeps everything at DEBUG.
+# Override with e.g. HOLOD_CONSOLE_LOG_LEVEL=DEBUG or =CRITICAL.
+_CONSOLE_LEVEL: Final[str] = os.environ.get("HOLOD_CONSOLE_LOG_LEVEL", "INFO").upper()
 
 
 # Thread-safe queue for all log records; the QueueListener runs in the same
@@ -154,7 +158,16 @@ rich_handler = RichHandler(
     # in colab environment setting this to true this prints an invalid escape sequence
     enable_link_path=False,
 )
-rich_handler.setLevel(logging.INFO)
+rich_handler.setLevel(_CONSOLE_LEVEL)
+
+
+def set_console_level(level: int | str) -> None:
+    """Set the minimum level mirrored to the Rich console handler.
+
+    Used for test runs: the QueueListener writes from a background thread, so
+    console output can slip past pytest's capture and garble the report.
+    """
+    rich_handler.setLevel(level)
 
 
 class _RichConsoleGate(logging.Filter):
