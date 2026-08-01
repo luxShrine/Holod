@@ -208,8 +208,10 @@ class HolodDatabase:
         )
         cur = self.conn.cursor()
         holo_tuples = [h.as_tuple() for h in hologram_details]
-        # `returning=True` keeps each statement's result set; they are walked with nextset().
-        cur.executemany(stmt, holo_tuples, returning=True)
+        # ensure that regardless of executemany internals that this is done as one batch
+        with self.transaction():
+            # `returning=True` keeps each statement's result set; they are walked with nextset().
+            cur.executemany(stmt, holo_tuples, returning=True)
 
         ids: list[int] = []
         while True:
