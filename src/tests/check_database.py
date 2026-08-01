@@ -127,9 +127,9 @@ def test_schema_version_matches_alembic_head() -> None:
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
-    from holod.infra.util.paths import repo_root
+    repo_root = Path(__file__).resolve().parents[2].absolute()
 
-    head = ScriptDirectory.from_config(Config(str(repo_root() / "alembic.ini"))).get_current_head()
+    head = ScriptDirectory.from_config(Config(str(repo_root / "alembic.ini"))).get_current_head()
     assert head == SCHEMA_VERSION, (
         f"SCHEMA_VERSION={SCHEMA_VERSION} but the alembic head is {head}; "
         "bump SCHEMA_VERSION in database.py when adding a migration"
