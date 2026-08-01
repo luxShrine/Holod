@@ -125,7 +125,7 @@ class HolodDatabase:
         """Close the connection on leaving a `with` block, error or not."""
         self.close()
 
-    def transaction(self):
+    def transaction(self, force_rollback: bool = False):
         """Group several statements into one atomic unit.
 
         Under autocommit each statement commits on its own, which is the right default for
@@ -138,7 +138,7 @@ class HolodDatabase:
                 rs = db.insert_recording_session(ds, ...)
                 db.insert_hologram([...])
         """
-        return self.conn.transaction()
+        return self.conn.transaction(force_rollback=force_rollback)
 
     def _execute(self, stmt: LiteralString, data: tuple[Any, ...]):
         cursor = self.conn.cursor()
