@@ -566,3 +566,152 @@ def test_context_manager_closes() -> None:
     with HolodDatabase() as handle:
         assert not handle.conn.closed
     assert handle.conn.closed
+
+
+# -- select mechanics -----------------------------------------------------------
+#
+# The reads are the mirror of the inserts above: every column named in a SELECT
+# has to still exist, the values have to come back as the types the writers put
+# in, and the `condition`/`column`/`amount` arguments have to reach the generated
+# SQL.
+
+
+def test_select_dataset(clean_db: HolodDatabase) -> None:
+    """A registered dataset comes back whole when filtered on its unique name."""
+    marker = "select-marker-ds"
+    dataset_id = clean_db.register_dataset(marker, Path("b/"))
+
+    rows = clean_db.select_dataset(condition=("name", marker))
+
+    assert len(rows) == 1
+    (row_id, name, root_path, created_at) = rows[0]
+    assert (row_id, name, root_path) == (dataset_id, marker, "b")
+    assert isinstance(created_at, datetime)
+
+
+def test_select_recording_session(clean_db: HolodDatabase) -> None:
+    """Session optics round-trip as floats, found through their dataset_id."""
+    marker_wvl = 0.000405
+    marker_lds = 1.89
+    marker_pxp = 0.0038
+    dataset_id = clean_db.register_dataset("select-rs-ds", Path("c/"))
+    session_id = clean_db.insert_recording_session(dataset_id, marker_wvl, marker_lds, marker_pxp)
+
+    rows = clean_db.select_recording_session(condition=("dataset_id", dataset_id))
+
+    assert len(rows) == 1
+    assert rows[0] == (session_id, dataset_id, marker_wvl, marker_lds, marker_pxp, None)
+
+
+def test_select_hologram(clean_db: HolodDatabase) -> None:
+    """A hologram round-trips, digest included, filtered on its session."""
+    marker_rel_path = Path("d/holo.png")
+    marker_z_um = 1500.0
+    _, session_id = make_session(clean_db, "select-holo-ds")
+    (holo_id,) = clean_db.insert_hologram(
+        [HologramDetail(session_id, marker_rel_path, marker_z_um, DIGEST)]
+    )
+
+    rows = clean_db.select_holograms(condition=("recording_session_id", session_id))
+
+    assert len(rows) == 1
+    assert rows[0] == (holo_id, session_id, marker_rel_path.as_posix(), marker_z_um, DIGEST)
+
+
+def test_select_run(clean_db: HolodDatabase) -> None:
+    """A run round-trips, and its JSONB config comes back as a dict, not a string."""
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+
+    rows = clean_db.select_run(condition=("id", run_id))
+
+    assert len(rows) == 1
+    (row_id, git_commit, config_hash, config, started_at, finished_at, status) = rows[0]
+    assert (row_id, git_commit, config_hash) == (run_id, GIT_COMMIT, CONFIG_HASH)
+    assert config == CONFIG, "jsonb should load as a dict"
+    assert (isinstance(started_at, datetime), finished_at, status) == (True, None, "running")
+
+
+def test_select_prediction(clean_db: HolodDatabase) -> None:
+    """A prediction round-trips with the ids of the run and hologram it points at."""
+    marker_epoch = 50
+    marker_predicted_z_mm = 0.67
+    marker_focus_score = 0.899
+    _, session_id = make_session(clean_db, "select-pred-ds")
+    (holo_id,) = clean_db.insert_hologram(
+        [HologramDetail(session_id, Path("e/holo.png"), 1500.0, DIGEST)]
+    )
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    clean_db.insert_prediction(
+        run_id, holo_id, marker_epoch, marker_predicted_z_mm, marker_focus_score
+    )
+
+    rows = clean_db.select_prediction(condition=("run_id", run_id))
+
+    assert len(rows) == 1
+    assert rows[0] == (run_id, holo_id, marker_epoch, marker_predicted_z_mm, marker_focus_score)
+
+
+def test_select_single_column(clean_db: HolodDatabase) -> None:
+    """`column` narrows the projection instead of returning the whole row."""
+    marker = "select-column-ds"
+    clean_db.register_dataset(marker, Path("one/column/"))
+
+    assert clean_db.select_dataset(column="root_path", condition=("name", marker)) == [
+        ("one/column",)
+    ]
+
+
+def test_select_amount_limits_rows(clean_db: HolodDatabase) -> None:
+    """`amount` caps the result, and 0 is a legal cap rather than "no limit"."""
+    _, session_id = make_session(clean_db, "select-amount-ds")
+    clean_db.insert_hologram(
+        [HologramDetail(session_id, Path(f"img/{i:04d}.png"), 1500.0 + i, DIGEST) for i in range(5)]
+    )
+    condition = ("recording_session_id", session_id)
+
+    assert len(clean_db.select_holograms(condition=condition, amount=2)) == 2
+    assert len(clean_db.select_holograms(condition=condition, amount=99)) == 5
+    assert clean_db.select_holograms(condition=condition, amount=0) == []
+
+
+def test_select_negative_amount_rejected(clean_db: HolodDatabase) -> None:
+    """A negative cap is caught in Python; Postgres would raise on the LIMIT anyway."""
+    with pytest.raises(ValueError, match="negative"):
+        clean_db.select_dataset(amount=-1)
+
+
+def test_select_no_match_returns_empty(clean_db: HolodDatabase) -> None:
+    """A condition matching nothing yields an empty list, not an error."""
+    assert clean_db.select_dataset(condition=("name", "no-such-dataset")) == []
+
+
+def test_select_condition_none_matches_null(clean_db: HolodDatabase) -> None:
+    """A None value compares with IS NULL.
+
+    Rendered as `= NULL` it would be neither true nor false but NULL, so the
+    query would quietly return nothing at all instead of the unfinished runs.
+    """
+    moment = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+    unfinished = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    finished = clean_db.insert_run(
+        GIT_COMMIT, CONFIG_HASH, CONFIG, finished_at=moment, status="completed"
+    )
+
+    # The cap has to clear however many unfinished runs the database already holds,
+    # since this test only asserts about the two rows it wrote itself.
+    unfinished_ids = {
+        row[0]
+        for row in clean_db.select_run(column="id", condition=("finished_at", None), amount=10_000)
+    }
+    assert unfinished in unfinished_ids
+    assert finished not in unfinished_ids
+    assert clean_db.select_run(column="id", condition=("finished_at", moment)) == [(finished,)]
+
+
+def test_select_quotes_identifiers(clean_db: HolodDatabase) -> None:
+    """Column names are quoted, so a hostile one fails as a bad column, not as SQL."""
+    with pytest.raises(psycopg.errors.UndefinedColumn), clean_db.transaction():
+        clean_db.select_dataset(condition=("name; DROP TABLE dataset", "x"))
+
+    # The table is still there: the statement above never parsed as two statements.
+    assert clean_db.select_dataset(column="id", amount=1) is not None

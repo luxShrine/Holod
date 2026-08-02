@@ -151,9 +151,11 @@ class HolodDatabase:
         """
         return self.conn.transaction(force_rollback=force_rollback)
 
-    def _execute(self, stmt: LiteralString, data: tuple[Any, ...]):
+    def _execute(
+        self, stmt: LiteralString | sql.SQL | sql.Composed, data: tuple[Any, ...] | None = None
+    ):
         cursor = self.conn.cursor()
-        cursor.execute(stmt, data)
+        return cursor.execute(stmt, data)
 
     def _execute_returning_id(self, stmt: LiteralString, data: tuple[Any, ...]) -> int:
         """Run an INSERT ... RETURNING id and hand back the generated key."""
@@ -278,3 +280,82 @@ class HolodDatabase:
             "VALUES (%s, %s, %s, %s, %s);"
         )
         self._execute(stmt, (run_id, hologram_id, epoch, predicted_z_mm, focus_score))
+
+    def _select(
+        self,
+        table: LiteralString,
+        column: str | None,
+        condition: tuple[str, Any] | None,
+        amount: int,
+    ) -> list[tuple[Any, ...]]:
+        """Run `SELECT <column> FROM <table> [WHERE <field> = <value>] LIMIT <amount>`."""
+        if amount < 0:
+            raise ValueError(f"amount must not be negative, got {amount}")
+
+        column_sql = sql.Identifier(column) if column is not None else sql.SQL("*")
+        tbl_sql = sql.Identifier(table)
+
+        if condition is None:
+            stmt = sql.SQL("SELECT {column} FROM {tbl} LIMIT %s;").format(
+                column=column_sql, tbl=tbl_sql
+            )
+            return self._execute(stmt, (amount,)).fetchall()
+
+        (field, value) = condition
+        # `= NULL` is never true, not even for a NULL column, so a None here has to
+        # become IS NULL or the query silently returns nothing.
+        comparison = sql.SQL("IS NULL") if value is None else sql.SQL("= %s")
+        stmt = sql.SQL("SELECT {column} FROM {tbl} WHERE {field} {comparison} LIMIT %s;").format(
+            column=column_sql, tbl=tbl_sql, field=sql.Identifier(field), comparison=comparison
+        )
+        data = (amount,) if value is None else (value, amount)
+        return self._execute(stmt, data).fetchall()
+
+    def select_dataset(
+        self,
+        column: str | None = None,
+        condition: tuple[str, Any] | None = None,
+        amount: int = 50,
+    ) -> list[tuple[Any, ...]]:
+        """Select datasets from the Holod database.
+
+        `column` defaults to every column; `condition` is a (column, value) pair
+        filtering the rows, and `amount` caps how many come back.
+        """
+        return self._select("dataset", column, condition, amount)
+
+    def select_recording_session(
+        self,
+        column: str | None = None,
+        condition: tuple[str, Any] | None = None,
+        amount: int = 50,
+    ) -> list[tuple[Any, ...]]:
+        """Select recording sessions from the Holod database."""
+        return self._select("recording_session", column, condition, amount)
+
+    def select_holograms(
+        self,
+        column: str | None = None,
+        condition: tuple[str, Any] | None = None,
+        amount: int = 50,
+    ) -> list[tuple[Any, ...]]:
+        """Select holograms from the Holod database."""
+        return self._select("hologram", column, condition, amount)
+
+    def select_run(
+        self,
+        column: str | None = None,
+        condition: tuple[str, Any] | None = None,
+        amount: int = 50,
+    ) -> list[tuple[Any, ...]]:
+        """Select runs from the Holod database."""
+        return self._select("run", column, condition, amount)
+
+    def select_prediction(
+        self,
+        column: str | None = None,
+        condition: tuple[str, Any] | None = None,
+        amount: int = 50,
+    ) -> list[tuple[Any, ...]]:
+        """Select predictions from the Holod database."""
+        return self._select("prediction", column, condition, amount)
