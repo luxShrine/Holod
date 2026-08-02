@@ -31,7 +31,14 @@ import psycopg
 import pytest
 
 from holod.infra import database
-from holod.infra.database import SCHEMA_VERSION, DBCredentials, HolodDatabase, HologramDetail
+from holod.infra.database import (
+    SCHEMA_VERSION,
+    DBCredentials,
+    DSId,
+    HolodDatabase,
+    HologramDetail,
+    RSId,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -95,7 +102,7 @@ def clean_db(db: HolodDatabase) -> Iterator[HolodDatabase]:
         raise psycopg.Rollback
 
 
-def make_session(db: HolodDatabase, name: str = "test-ds") -> tuple[int, int]:
+def make_session(db: HolodDatabase, name: str = "test-ds") -> tuple[DSId, RSId]:
     """Create a dataset and a recording session; return both ids."""
     dataset_id = db.register_dataset(name, Path("test_root/"))
     session_id = db.insert_recording_session(dataset_id, 0.000405, 12.0, 0.0038)
@@ -292,7 +299,7 @@ def test_invalid_run_status_rejected(clean_db: HolodDatabase) -> None:
 def test_orphan_recording_session_rejected(clean_db: HolodDatabase) -> None:
     """A recording session cannot reference a dataset that does not exist."""
     with pytest.raises(psycopg.errors.ForeignKeyViolation), clean_db.transaction():
-        clean_db.insert_recording_session(-1, 0.000405, 12.0, 0.0038)
+        clean_db.insert_recording_session(DSId(-1), 0.000405, 12.0, 0.0038)
 
 
 def test_deleting_dataset_cascades(clean_db: HolodDatabase) -> None:
@@ -325,7 +332,7 @@ def test_hologram_detail_as_tuple_renders_path() -> None:
     psycopg has no adapter for pathlib.Path, so passing one through raises
     "cannot adapt type 'WindowsPath'". No database needed.
     """
-    detail = HologramDetail(1, Path("img/0001.png"), 1500.0, DIGEST)
+    detail = HologramDetail(RSId(1), Path("img/0001.png"), 1500.0, DIGEST)
     rendered = detail.as_tuple()[1]
     assert isinstance(rendered, str)
     assert rendered == "img/0001.png"

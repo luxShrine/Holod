@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any, LiteralString, Self
+from typing import Any, LiteralString, NewType, Self
 
 import dotenv
 import psycopg
@@ -20,6 +20,13 @@ def _get_env_or_user(key: str) -> str:
 
 def _convert_dict_jsonb(config: dict):
     return psycopg.types.json.Jsonb(config)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+DSId = NewType("DSId", int)
+HoloId = NewType("HoloId", int)
+RSId = NewType("RSId", int)
+RunId = NewType("RunId", int)
+PredId = NewType("PredId", int)
 
 
 class DBCredentials:
@@ -66,7 +73,7 @@ class DBCredentials:
 class HologramDetail:
     """Dataclass containing hologram data."""
 
-    recording_session_id: int
+    recording_session_id: RSId
     relative_path: Path
     z_depth_um: float
     sha256: bytes
@@ -167,7 +174,7 @@ class HolodDatabase:
 
     def register_dataset(
         self, name: str, root_path: Path, created_at: datetime | None = None
-    ) -> int:
+    ) -> DSId:
         """Register a new dataset to the Holod database."""
         # created_at has a NOT NULL DEFAULT now(); COALESCE reproduces it for the None case.
         # `name` is UNIQUE, so re-registering an existing dataset refreshes the path rather
@@ -178,16 +185,16 @@ class HolodDatabase:
             "ON CONFLICT (name) DO UPDATE SET root_path = EXCLUDED.root_path "
             "RETURNING id;"
         )
-        return self._execute_returning_id(stmt, (name, root_path.as_posix(), created_at))
+        return DSId(self._execute_returning_id(stmt, (name, root_path.as_posix(), created_at)))
 
     def insert_recording_session(
         self,
-        dataset_id: int,
+        dataset_id: DSId,
         wavelength_mm: float,
         l_distance_mm: float,
         pixel_pitch_mm: float,
         recorded_at: datetime | None = None,
-    ) -> int:
+    ) -> RSId:
         """Insert a new recording session row."""
         # recorded_at is nullable with no default, so None can be passed through as NULL.
         stmt = (
@@ -196,11 +203,13 @@ class HolodDatabase:
             "VALUES (%s, %s, %s, %s, %s) "
             "RETURNING id;"
         )
-        return self._execute_returning_id(
-            stmt, (dataset_id, wavelength_mm, l_distance_mm, pixel_pitch_mm, recorded_at)
+        return RSId(
+            self._execute_returning_id(
+                stmt, (dataset_id, wavelength_mm, l_distance_mm, pixel_pitch_mm, recorded_at)
+            )
         )
 
-    def insert_hologram(self, hologram_details: list[HologramDetail]) -> list[int]:
+    def insert_hologram(self, hologram_details: list[HologramDetail]) -> list[HoloId]:
         """Batch-insert holograms, returning the generated ids in input order."""
         if not hologram_details:
             return []
@@ -217,7 +226,7 @@ class HolodDatabase:
             # `returning=True` keeps each statement's result set; they are walked with nextset().
             cur.executemany(stmt, holo_tuples, returning=True)
 
-        ids: list[int] = []
+        ids: list[HoloId] = []
         while True:
             row = cur.fetchone()
             if row is not None:
@@ -234,7 +243,7 @@ class HolodDatabase:
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
         status: str | None = None,
-    ) -> int:
+    ) -> RunId:
         """Insert a new training run row."""
         json_config = _convert_dict_jsonb(config)
         # started_at and status have NOT NULL DEFAULTs; COALESCE reproduces them for the
@@ -245,20 +254,24 @@ class HolodDatabase:
             "COALESCE(%s::text, 'running')) "
             "RETURNING id;"
         )
-        return self._execute_returning_id(
-            stmt, (git_commit, config_hash, json_config, started_at, finished_at, status)
+        return RunId(
+            self._execute_returning_id(
+                stmt, (git_commit, config_hash, json_config, started_at, finished_at, status)
+            )
         )
 
     def insert_prediction(
         self,
-        run_id: int,
-        hologram_id: int,
+        run_id: RunId,
+        hologram_id: HoloId,
         epoch: int,
         predicted_z_mm: float,
         focus_score: float | None = None,
     ):
-        """Insert a new prediction session row."""
-        # (run_id, hologram_id, epoch) is the PK, so there is nothing to return.
+        """Insert a new prediction session row.
+
+        (run_id, hologram_id, epoch) is the PK, so there is nothing to return.
+        """
         # focus_score is nullable with no default, so None can be passed through as NULL.
         stmt = (
             "INSERT INTO prediction (run_id, hologram_id, epoch, predicted_z_mm, focus_score) "
