@@ -37,7 +37,11 @@ from holod.infra.database import (
     DSId,
     HolodDatabase,
     HologramDetail,
+    HologramRow,
+    PredictionRow,
+    RecordingRow,
     RSId,
+    TableRow,
 )
 
 if TYPE_CHECKING:
@@ -600,7 +604,7 @@ def test_select_recording_session(clean_db: HolodDatabase) -> None:
     rows = clean_db.select_recording_session(condition=("dataset_id", dataset_id))
 
     assert len(rows) == 1
-    assert rows[0] == (session_id, dataset_id, marker_wvl, marker_lds, marker_pxp, None)
+    assert rows[0] == RecordingRow(session_id, dataset_id, marker_wvl, marker_lds, marker_pxp, None)
 
 
 def test_select_hologram(clean_db: HolodDatabase) -> None:
@@ -615,7 +619,9 @@ def test_select_hologram(clean_db: HolodDatabase) -> None:
     rows = clean_db.select_holograms(condition=("recording_session_id", session_id))
 
     assert len(rows) == 1
-    assert rows[0] == (holo_id, session_id, marker_rel_path.as_posix(), marker_z_um, DIGEST)
+    assert rows[0] == HologramRow(
+        holo_id, session_id, marker_rel_path.as_posix(), marker_z_um, DIGEST
+    )
 
 
 def test_select_run(clean_db: HolodDatabase) -> None:
@@ -648,7 +654,9 @@ def test_select_prediction(clean_db: HolodDatabase) -> None:
     rows = clean_db.select_prediction(condition=("run_id", run_id))
 
     assert len(rows) == 1
-    assert rows[0] == (run_id, holo_id, marker_epoch, marker_predicted_z_mm, marker_focus_score)
+    assert rows[0] == PredictionRow(
+        run_id, holo_id, marker_epoch, marker_predicted_z_mm, marker_focus_score
+    )
 
 
 def test_select_single_column(clean_db: HolodDatabase) -> None:
@@ -702,6 +710,7 @@ def test_select_condition_none_matches_null(clean_db: HolodDatabase) -> None:
     unfinished_ids = {
         row[0]
         for row in clean_db.select_run(column="id", condition=("finished_at", None), amount=10_000)
+        if not isinstance(row, TableRow) and isinstance(row[0], int)
     }
     assert unfinished in unfinished_ids
     assert finished not in unfinished_ids
