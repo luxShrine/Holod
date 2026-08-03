@@ -613,6 +613,10 @@ class CompareUserConfig:
             sch_patience=t_cfg.train.sch_patience,
         )
 
+    def as_dict(self) -> dict:
+        """Return `CompareUserConfig` object as a dictionary."""
+        return asdict(self)
+
 
 @dataclass
 class CoreTrainer:

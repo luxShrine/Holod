@@ -1,4 +1,6 @@
 import json
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -7,6 +9,7 @@ import numpy.typing as npt
 from click.core import ParameterSource
 
 from holod.infra.data import CompareUserConfig
+from holod.infra.database import HolodDatabase, Tables
 from holod.infra.log import get_logger, init_logging
 from holod.infra.util.paths import (
     checkpoints_loc,
@@ -39,6 +42,11 @@ def _cli_overrides(**values: Any) -> dict[str, Any]:
         for name, value in values.items()
         if ctx.get_parameter_source(name) != ParameterSource.DEFAULT
     }
+
+
+def _get_git_revision_hash() -> str:
+    """Get the full 40-character commit hash."""
+    return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()
 
 
 def _resume_checkpoint(selected: ModelType) -> str | None:
@@ -176,6 +184,13 @@ def cli():
     show_default=True,
     help="Assign each sample's holograms entirely to train or eval, never both.",
 )
+@click.option(
+    "--db/--database",
+    "database_enable",
+    default=False,
+    show_default=True,
+    help="Enable experimental database features.",
+)
 def train(
     ds_root: str,
     meta_csv_name: str,
@@ -193,6 +208,7 @@ def train(
     create_csv: bool,
     sample: bool,
     split_by_sample: bool,
+    database_enable: bool,
 ) -> None:
     """Train the autofocus model based on supplied dataset.
 
@@ -285,9 +301,22 @@ def train(
     else:
         raise Exception("Config file not found, expected 'train_settings.toml' in repo root.")
 
-    autofocus_config.legacy_random_crop = True  # WARN: remove do not commit
-    plot_info: PlotPred = train_autofocus(autofocus_config, path_ckpt)
-    plot_info.save_to_file()
+    plot_info: PlotPred
+    if database_enable:
+        db = HolodDatabase()
+        run_id = db.insert_run(
+            _get_git_revision_hash(), config.as_dict(), datetime.now(), status="running"
+        )
+        try:
+            plot_info = train_autofocus(autofocus_config, path_ckpt)
+            _ = db.update(Tables.Run, "status", "completed", ("id", run_id))
+            _ = db.update(Tables.Run, "finished_at", datetime.now(), ("id", run_id))
+            plot_info.save_to_file()
+        except Exception:
+            db.update(Tables.Run, "status", "failed", ("id", run_id))
+    else:
+        plot_info = train_autofocus(autofocus_config, path_ckpt)
+        plot_info.save_to_file()
 
 
 @cli.command()
