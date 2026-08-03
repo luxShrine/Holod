@@ -30,6 +30,7 @@ DSId = NewType("DSId", int)
 RSId = NewType("RSId", int)
 HoloId = NewType("HoloId", int)
 RunId = NewType("RunId", int)
+type RowId = DSId | RSId | HoloId | RunId
 
 
 # -- output types ------
@@ -144,6 +145,20 @@ class Tables(StrEnum):
                 return class_row(RunRow)
             case Tables.Prediction:
                 return class_row(PredictionRow)
+
+    def get_Id_type(self, id_value: int) -> RowId | None:
+        """Return the ID in a type that maps to table's respective ID, or None if PK is complex."""
+        match self:
+            case Tables.Dataset:
+                return DSId(id_value)
+            case Tables.Recording_Session:
+                return RSId(id_value)
+            case Tables.Hologram:
+                return HoloId(id_value)
+            case Tables.Run:
+                return RunId(id_value)
+            case Tables.Prediction:
+                return None
 
 
 # -- ------
@@ -494,3 +509,30 @@ class HolodDatabase:
     ) -> list[tuple[SQLTypes, ...]] | list[TableRow]:
         """Select predictions from the Holod database."""
         return self._select(Tables("prediction"), column, condition, amount)
+
+    def update(
+        self,
+        table: Tables,
+        column: str,
+        updated_value: Any,
+        condition: tuple[str, Any],
+    ) -> RowId | None:
+        """Run `UPDATE <table> SET <column> = <updated_value> WHERE <field> = <field_value>`."""
+        tbl_sql = sql.Identifier(table.lower())
+        (field, field_value) = condition
+        column_sql = sql.Identifier(column)
+
+        comparison = sql.SQL("IS NULL") if field_value is None else sql.SQL("= %s")
+        data = (updated_value,) if field_value is None else (updated_value, field_value)
+        stmt = "UPDATE {tbl} SET {column} = %s WHERE {field} {comparison}"
+        if isinstance(table, PredictionRow):
+            stmt = sql.SQL(stmt + ";").format(
+                column=column_sql, tbl=tbl_sql, field=sql.Identifier(field), comparison=comparison
+            )
+            self._execute(stmt, data)
+            return None
+
+        stmt = sql.SQL(stmt + "RETURNING id;").format(
+            column=column_sql, tbl=tbl_sql, field=sql.Identifier(field), comparison=comparison
+        )
+        return table.get_Id_type(self._execute_returning_id(stmt, data))
