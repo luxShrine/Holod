@@ -23,10 +23,9 @@ def _convert_dict_jsonb(config: dict):
 
 
 DSId = NewType("DSId", int)
-HoloId = NewType("HoloId", int)
 RSId = NewType("RSId", int)
+HoloId = NewType("HoloId", int)
 RunId = NewType("RunId", int)
-PredId = NewType("PredId", int)
 
 
 class DBCredentials:
