@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum, auto
 from pathlib import Path
 from types import TracebackType
-from typing import Any, LiteralString, NewType, Self
+from typing import Any, Literal, LiteralString, NewType, Self
 
 import dotenv
 import psycopg
@@ -394,7 +394,7 @@ class HolodDatabase:
         config: dict,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
-        status: str | None = None,
+        status: Literal["running", "completed", "failed"] | None = None,
     ) -> RunId:
         """Insert a new training run row."""
         json_config = _convert_dict_jsonb(config)
