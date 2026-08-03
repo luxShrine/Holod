@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -24,6 +26,10 @@ def _get_env_or_user(key: str) -> str:
 def _convert_dict_jsonb(config: dict):
     """Wrap a dict so psycopg adapts it to a `jsonb` column instead of a text literal."""
     return psycopg.types.json.Jsonb(config)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _hash_config(config: dict):
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 DSId = NewType("DSId", int)
@@ -299,7 +305,9 @@ class HolodDatabase:
         )
         return cursor.execute(stmt, data)
 
-    def _execute_returning_id(self, stmt: LiteralString, data: tuple[Any, ...]) -> int:
+    def _execute_returning_id(
+        self, stmt: LiteralString | sql.SQL | sql.Composed, data: tuple[Any, ...]
+    ) -> int:
         """Run an INSERT ... RETURNING id and hand back the generated key."""
         cursor = self.conn.cursor()
         row = cursor.execute(stmt, data).fetchone()
@@ -383,7 +391,6 @@ class HolodDatabase:
     def insert_run(
         self,
         git_commit: str,
-        config_hash: str,
         config: dict,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
@@ -391,6 +398,7 @@ class HolodDatabase:
     ) -> RunId:
         """Insert a new training run row."""
         json_config = _convert_dict_jsonb(config)
+        hash_config = _hash_config(config)
         # started_at and status have NOT NULL DEFAULTs; COALESCE reproduces them for the
         # None cases. finished_at is nullable with no default, so None passes through.
         stmt = (
@@ -401,7 +409,7 @@ class HolodDatabase:
         )
         return RunId(
             self._execute_returning_id(
-                stmt, (git_commit, config_hash, json_config, started_at, finished_at, status)
+                stmt, (git_commit, hash_config, json_config, started_at, finished_at, status)
             )
         )
 
@@ -435,7 +443,7 @@ class HolodDatabase:
         if amount < 0:
             raise ValueError(f"amount must not be negative, got {amount}")
 
-        # TODO: if no column, then we should use the row factory from each dataclass per database
+        # if no column, then we use the row factory from each dataclass per database
         if column is None:
             row_factory = table.get_row_factory()
             column_sql = sql.SQL("*")

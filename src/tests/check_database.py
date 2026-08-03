@@ -48,8 +48,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 GIT_COMMIT = "a" * 40  # run.git_commit is CHAR(40); short values would be blank-padded
-CONFIG_HASH = "b" * 64  # run.config_hash is CHAR(64)
 CONFIG = {"lr": 0.0001}  # run.config is JSONB, so this has to parse as JSON
+CONFIG_HASH = database._hash_config(CONFIG)  # run.config_hash is CHAR(64)
 DIGEST = bytes(32)  # hologram.sha256 is CHECK (octet_length(sha256) = 32)
 
 
@@ -229,7 +229,7 @@ def test_every_insert_reaches_the_database(clean_db: HolodDatabase) -> None:
     holo_ids = clean_db.insert_hologram(
         [HologramDetail(session_id, Path("img/0001.png"), 1500.0, DIGEST)]
     )
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
     clean_db.insert_prediction(run_id, holo_ids[0], epoch=0, predicted_z_mm=1.5)
 
     assert dataset_id > 0
@@ -274,7 +274,7 @@ def test_duplicate_prediction_key_raises(clean_db: HolodDatabase) -> None:
     (holo_id,) = clean_db.insert_hologram(
         [HologramDetail(session_id, Path("img/p.png"), 1500.0, DIGEST)]
     )
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
     clean_db.insert_prediction(run_id, holo_id, epoch=3, predicted_z_mm=1.5)
 
     with pytest.raises(psycopg.errors.UniqueViolation), clean_db.transaction():
@@ -297,7 +297,7 @@ def test_sha256_must_be_32_bytes(clean_db: HolodDatabase) -> None:
 def test_invalid_run_status_rejected(clean_db: HolodDatabase) -> None:
     """run.status only accepts running/completed/failed."""
     with pytest.raises(psycopg.errors.CheckViolation), clean_db.transaction():
-        clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG, status="bogus")
+        clean_db.insert_run(GIT_COMMIT, CONFIG, status="bogus")  # pyright: ignore[reportArgumentType]
 
 
 def test_orphan_recording_session_rejected(clean_db: HolodDatabase) -> None:
@@ -312,7 +312,7 @@ def test_deleting_dataset_cascades(clean_db: HolodDatabase) -> None:
     (holo_id,) = clean_db.insert_hologram(
         [HologramDetail(session_id, Path("img/c.png"), 1500.0, DIGEST)]
     )
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
     clean_db.insert_prediction(run_id, holo_id, epoch=0, predicted_z_mm=1.5)
 
     clean_db.conn.execute("DELETE FROM dataset WHERE id = %s;", (dataset_id,))
@@ -411,7 +411,7 @@ def test_insert_run_defaults(clean_db: HolodDatabase) -> None:
         "RETURNING started_at, status;",
         (GIT_COMMIT, CONFIG_HASH, jsonb_config),
     )
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
     actual = one_row(clean_db, "SELECT started_at, status FROM run WHERE id = %s;", (run_id,))
 
     assert actual == expected
@@ -420,9 +420,7 @@ def test_insert_run_defaults(clean_db: HolodDatabase) -> None:
 def test_explicit_values_override_defaults(clean_db: HolodDatabase) -> None:
     """The other half of COALESCE: a supplied value is the one stored."""
     moment = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
-    run_id = clean_db.insert_run(
-        GIT_COMMIT, CONFIG_HASH, CONFIG, started_at=moment, status="completed"
-    )
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG, started_at=moment, status="completed")
     dataset_id = clean_db.register_dataset("explicit-ds", Path("a/"), created_at=moment)
 
     assert one_row(clean_db, "SELECT started_at, status FROM run WHERE id = %s;", (run_id,)) == (
@@ -440,7 +438,7 @@ def test_nullable_columns_stay_null(clean_db: HolodDatabase) -> None:
     (holo_id,) = clean_db.insert_hologram(
         [HologramDetail(session_id, Path("img/n.png"), 1500.0, DIGEST)]
     )
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
     clean_db.insert_prediction(run_id, holo_id, epoch=0, predicted_z_mm=1.5)
 
     assert one_row(
@@ -482,7 +480,7 @@ def test_full_chain_round_trip(clean_db: HolodDatabase) -> None:
     (holo_id,) = clean_db.insert_hologram(
         [HologramDetail(session_id, Path("img/chain.png"), 1500.0, DIGEST)]
     )
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
     clean_db.insert_prediction(run_id, holo_id, epoch=0, predicted_z_mm=1.5)
 
     row = one_row(
@@ -626,7 +624,7 @@ def test_select_hologram(clean_db: HolodDatabase) -> None:
 
 def test_select_run(clean_db: HolodDatabase) -> None:
     """A run round-trips, and its JSONB config comes back as a dict, not a string."""
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
 
     rows = clean_db.select_run(condition=("id", run_id))
 
@@ -646,7 +644,7 @@ def test_select_prediction(clean_db: HolodDatabase) -> None:
     (holo_id,) = clean_db.insert_hologram(
         [HologramDetail(session_id, Path("e/holo.png"), 1500.0, DIGEST)]
     )
-    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG)
     clean_db.insert_prediction(
         run_id, holo_id, marker_epoch, marker_predicted_z_mm, marker_focus_score
     )
@@ -700,10 +698,8 @@ def test_select_condition_none_matches_null(clean_db: HolodDatabase) -> None:
     query would quietly return nothing at all instead of the unfinished runs.
     """
     moment = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
-    unfinished = clean_db.insert_run(GIT_COMMIT, CONFIG_HASH, CONFIG)
-    finished = clean_db.insert_run(
-        GIT_COMMIT, CONFIG_HASH, CONFIG, finished_at=moment, status="completed"
-    )
+    unfinished = clean_db.insert_run(GIT_COMMIT, CONFIG)
+    finished = clean_db.insert_run(GIT_COMMIT, CONFIG, finished_at=moment, status="completed")
 
     # The cap has to clear however many unfinished runs the database already holds,
     # since this test only asserts about the two rows it wrote itself.
