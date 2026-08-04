@@ -94,9 +94,9 @@ class RunRow:
     id: RunId
     git_commit: str
     config_hash: str
-    config: str
+    config: dict
     started_at: datetime
-    finished_at: datetime
+    finished_at: datetime | None
     status: str
 
     def __iter__(self):
@@ -112,7 +112,7 @@ class PredictionRow:
     hologram_id: HoloId
     epoch: int
     predicted_z_mm: float
-    focus_score: float
+    focus_score: float | None
 
     def __iter__(self):
         """Yield the field values in column order, so the row unpacks like a tuple."""
@@ -541,14 +541,14 @@ class HolodDatabase:
         comparison = sql.SQL("IS NULL") if field_value is None else sql.SQL("= %s")
         data = (updated_value,) if field_value is None else (updated_value, field_value)
         stmt = "UPDATE {tbl} SET {column} = %s WHERE {field} {comparison}"
-        if isinstance(table, PredictionRow):
+        if table is Tables.Prediction:
             stmt = sql.SQL(stmt + ";").format(
                 column=column_sql, tbl=tbl_sql, field=sql.Identifier(field), comparison=comparison
             )
             self._execute(stmt, data)
             return None
 
-        stmt = sql.SQL(stmt + "RETURNING id;").format(
+        stmt = sql.SQL(stmt + " RETURNING id;").format(
             column=column_sql, tbl=tbl_sql, field=sql.Identifier(field), comparison=comparison
         )
         return table.get_Id_type(self._execute_returning_id(stmt, data))

@@ -21,18 +21,22 @@ then ``make test-db``. Without a reachable server every test here skips, unless
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, LiteralString
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from holod.infra import database
 from holod.infra.database import (
     SCHEMA_VERSION,
+    DatasetRow,
     DBCredentials,
     DSId,
     HolodDatabase,
@@ -41,11 +45,14 @@ from holod.infra.database import (
     PredictionRow,
     RecordingRow,
     RSId,
+    RunRow,
+    SQLTypes,
     TableRow,
+    Tables,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 GIT_COMMIT = "a" * 40  # run.git_commit is CHAR(40); short values would be blank-padded
 CONFIG = {"lr": 0.0001}  # run.config is JSONB, so this has to parse as JSON
@@ -720,3 +727,228 @@ def test_select_quotes_identifiers(clean_db: HolodDatabase) -> None:
 
     # The table is still there: the statement above never parsed as two statements.
     assert clean_db.select_dataset(column="id", amount=1) is not None
+
+
+# -- select: row-to-dataclass mapping -------------------------------------------
+#
+# `_select` has two modes and they return different shapes. With no `column` it
+# hands the cursor the table's `class_row` factory and rows arrive as that table's
+# dataclass; with a `column` there is no factory and rows arrive as plain tuples.
+#
+# `class_row` passes the columns to the dataclass **by name**, so a renamed field
+# is a TypeError rather than a silently mis-filled row. Field *order* is not free
+# either: `__iter__` yields `asdict()` in declaration order, which is what makes
+# `(a, b, c) = row` work, and that only lines up with `SELECT *` while the field
+# order still matches the table's ordinal order. Both halves are pinned below.
+
+
+@dataclass(frozen=True)
+class Seed:
+    """One populated table, plus what it takes to read that row back."""
+
+    select: Callable[..., list[tuple[SQLTypes, ...]] | list[TableRow]]
+    condition: tuple[str, Any]
+    expected: TableRow
+
+
+# The dataclass each table must map to. Written out rather than read from
+# `get_row_factory()`, so a match arm rewired to the wrong dataclass fails here
+# instead of agreeing with itself.
+ROW_TYPES: dict[Tables, type[TableRow]] = {
+    Tables.Dataset: DatasetRow,
+    Tables.Recording_Session: RecordingRow,
+    Tables.Hologram: HologramRow,
+    Tables.Run: RunRow,
+    Tables.Prediction: PredictionRow,
+}
+
+SEED_STARTED = datetime(2026, 5, 6, 7, 8, 9, tzinfo=UTC)
+SEED_FINISHED = datetime(2026, 5, 6, 9, 8, 7, tzinfo=UTC)
+
+
+@pytest.fixture
+def seeded(clean_db: HolodDatabase) -> dict[Tables, Seed]:
+    """Write one row into every table, giving each column a value unlike its neighbours'.
+
+    Distinct values matter: with 0.0 in three float columns a row assembled in the
+    wrong order would still compare equal.
+    """
+    dataset_id = clean_db.register_dataset("mechanics-ds", Path("mech/root"), SEED_STARTED)
+    session_id = clean_db.insert_recording_session(dataset_id, 0.000405, 12.5, 0.0038, SEED_STARTED)
+    (holo_id,) = clean_db.insert_hologram(
+        [HologramDetail(session_id, Path("mech/img/0001.png"), 1234.5, DIGEST)]
+    )
+    run_id = clean_db.insert_run(GIT_COMMIT, CONFIG, SEED_STARTED, SEED_FINISHED, "completed")
+    clean_db.insert_prediction(run_id, holo_id, 7, 2.25, 0.875)
+
+    return {
+        Tables.Dataset: Seed(
+            clean_db.select_dataset,
+            ("id", dataset_id),
+            DatasetRow(dataset_id, "mechanics-ds", "mech/root", SEED_STARTED),
+        ),
+        Tables.Recording_Session: Seed(
+            clean_db.select_recording_session,
+            ("id", session_id),
+            RecordingRow(session_id, dataset_id, 0.000405, 12.5, 0.0038, SEED_STARTED),
+        ),
+        Tables.Hologram: Seed(
+            clean_db.select_holograms,
+            ("id", holo_id),
+            HologramRow(holo_id, session_id, "mech/img/0001.png", 1234.5, DIGEST),
+        ),
+        Tables.Run: Seed(
+            clean_db.select_run,
+            ("id", run_id),
+            RunRow(
+                run_id, GIT_COMMIT, CONFIG_HASH, CONFIG, SEED_STARTED, SEED_FINISHED, "completed"
+            ),
+        ),
+        Tables.Prediction: Seed(
+            clean_db.select_prediction,
+            ("run_id", run_id),
+            PredictionRow(run_id, holo_id, 7, 2.25, 0.875),
+        ),
+    }
+
+
+def ordered_columns(db: HolodDatabase, table: str) -> list[str]:
+    """Return the table's column names in the order `SELECT *` emits them."""
+    rows = db.conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s ORDER BY ordinal_position;",
+        (table,),
+    ).fetchall()
+    return [str(column) for (column,) in rows]
+
+
+every_table = pytest.mark.parametrize("table", list(Tables), ids=[t.value for t in Tables])
+
+
+@every_table
+def test_row_factory_defined_for_every_table(table: Tables) -> None:
+    """Every table names a row factory.
+
+    `get_row_factory` matches without a fallback arm, so a table added to the enum
+    and not to the match returns None. `_select` reads that as "no factory" and
+    quietly hands back tuples instead of the dataclass, which is exactly the kind
+    of silent downgrade a caller unpacking attributes would not survive.
+    """
+    assert table.get_row_factory() is not None, f"{table.value} has no row factory"
+
+
+@every_table
+def test_select_returns_that_table_s_dataclass(seeded: dict[Tables, Seed], table: Tables) -> None:
+    """A column-less select yields the table's own dataclass, not a tuple or a sibling's."""
+    (row,) = seeded[table].select(condition=seeded[table].condition)
+
+    assert type(row) is ROW_TYPES[table]
+
+
+@every_table
+def test_select_preserves_every_field(seeded: dict[Tables, Seed], table: Tables) -> None:
+    """Every column comes back carrying the value that was written.
+
+    Dataclass equality compares the type as well as all the fields, so this covers
+    "right class" and "nothing mangled in transit" together -- including the ones
+    with a shape of their own: `sha256` stays 32 raw bytes rather than a memoryview
+    or a hex string, and `config` comes back as the dict that went in, since jsonb
+    round-trips through psycopg as an object rather than as JSON text.
+    """
+    (row,) = seeded[table].select(condition=seeded[table].condition)
+
+    assert row == seeded[table].expected
+
+
+@every_table
+def test_dataclass_fields_match_columns_in_order(
+    seeded: dict[Tables, Seed], clean_db: HolodDatabase, table: Tables
+) -> None:
+    """Field names and order track the table exactly.
+
+    Names are what `class_row` fills the dataclass by; order is what makes the
+    `__iter__` unpacking line up with `SELECT *`.
+    """
+    field_names = [field.name for field in dataclasses.fields(ROW_TYPES[table])]
+
+    assert field_names == ordered_columns(clean_db, table.value)
+
+
+@every_table
+def test_row_unpacks_in_column_order(
+    seeded: dict[Tables, Seed], clean_db: HolodDatabase, table: Tables
+) -> None:
+    """Iterating a row gives the same tuple a raw `SELECT *` would.
+
+    This is the promise `(row_id, name, root_path, created_at) = row` relies on;
+    reordering two same-typed fields would swap their values with nothing raising.
+    """
+    (row,) = seeded[table].select(condition=seeded[table].condition)
+    (field, value) = seeded[table].condition
+    stmt = sql.SQL("SELECT * FROM {tbl} WHERE {field} = %s;").format(
+        tbl=sql.Identifier(table.value), field=sql.Identifier(field)
+    )
+    raw = clean_db.conn.execute(stmt, (value,)).fetchone()
+
+    assert raw is not None
+    assert tuple(row) == tuple(raw)
+
+
+@every_table
+def test_selecting_a_column_gives_tuples(seeded: dict[Tables, Seed], table: Tables) -> None:
+    """Naming a column drops the row factory: each row is a 1-tuple holding that value."""
+    seed = seeded[table]
+    for field in dataclasses.fields(ROW_TYPES[table]):
+        rows = seed.select(column=field.name, condition=seed.condition)
+
+        assert type(rows[0]) is tuple, f"{table.value}.{field.name} should not be a dataclass"
+        assert rows == [(getattr(seed.expected, field.name),)]
+
+
+@every_table
+def test_selecting_a_column_never_builds_a_dataclass(
+    seeded: dict[Tables, Seed], table: Tables
+) -> None:
+    """The projected value is handed back bare, not wrapped in the table's row type.
+
+    A tuple subclass would satisfy the shape checks above while still being a
+    `TableRow`, so the negative is asserted on its own.
+    """
+    first_field = dataclasses.fields(ROW_TYPES[table])[0].name
+    (row,) = seeded[table].select(column=first_field, condition=seeded[table].condition)
+
+    assert not isinstance(row, TableRow)
+
+
+@every_table
+def test_select_unknown_column_rejected(
+    seeded: dict[Tables, Seed], clean_db: HolodDatabase, table: Tables
+) -> None:
+    """A column the table does not have fails loudly rather than returning nothing."""
+    with pytest.raises(psycopg.errors.UndefinedColumn), clean_db.transaction():
+        seeded[table].select(column="not_a_column", condition=seeded[table].condition)
+
+
+def test_get_id_type_matches_the_table(clean_db: HolodDatabase) -> None:
+    """Each table's id helper returns the value it was handed, and None where the PK is composite.
+
+    The NewTypes erase to int at runtime, so only the value and the None case are
+    observable -- but the None case is the one that matters, since `prediction` has
+    no `id` column for a caller to ask about.
+    """
+    for table in Tables:
+        expected = None if table is Tables.Prediction else 7
+        assert table.get_Id_type(7) == expected, f"{table.value} maps its id wrongly"
+
+
+def test_select_default_amount_is_fifty(clean_db: HolodDatabase) -> None:
+    """The default cap is 50, so an unbounded-looking select cannot pull a whole table."""
+    _, session_id = make_session(clean_db, "default-amount-ds")
+    clean_db.insert_hologram(
+        [
+            HologramDetail(session_id, Path(f"img/{i:04d}.png"), 1500.0 + i, DIGEST)
+            for i in range(60)
+        ]
+    )
+
+    assert len(clean_db.select_holograms(condition=("recording_session_id", session_id))) == 50
