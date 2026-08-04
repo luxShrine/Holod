@@ -261,6 +261,11 @@ class HolodDatabase:
                 "run `make db-migrate` or bump the python database version"
             )
 
+    def _ensure_open(self):
+        """Ensure that each operation is connected, otherwise no-op."""
+        if self.conn.closed:
+            self.conn = self.creds.connect()
+
     def close(self):
         """Close the connection. Idempotent, so it is safe on an already-closed instance."""
         self.conn.close()
@@ -300,6 +305,7 @@ class HolodDatabase:
         row_factory: RowFactory[TableRow] | None = None,
     ):
         """Execute one statement and return its cursor, optionally mapping rows to a dataclass."""
+        self._ensure_open()
         cursor = (
             self.conn.cursor() if row_factory is None else self.conn.cursor(row_factory=row_factory)
         )
@@ -309,6 +315,7 @@ class HolodDatabase:
         self, stmt: LiteralString | sql.SQL | sql.Composed, data: tuple[Any, ...]
     ) -> int:
         """Run an INSERT ... RETURNING id and hand back the generated key."""
+        self._ensure_open()
         cursor = self.conn.cursor()
         row = cursor.execute(stmt, data).fetchone()
         if row is None:
@@ -317,6 +324,7 @@ class HolodDatabase:
 
     def _execute_queries(self, query: sql.SQL | list[sql.SQL]):
         """Run one or more parameterless queries in order on a single cursor."""
+        self._ensure_open()
         if not isinstance(query, list):
             query = [query]
         queries: list[sql.SQL] = query
